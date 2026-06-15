@@ -86,6 +86,10 @@ async def run_agent_loop(
                 )
 
         if assistant_message is None:
+            if signal is not None and signal.is_cancelled():
+                yield ErrorEvent(message="Agent run cancelled", recoverable=True)
+                yield TurnEndEvent(turn=turn)
+                break
             yield TurnEndEvent(turn=turn)
             if saw_provider_error:
                 break

@@ -32,6 +32,7 @@ Tau currently has:
 - deterministic fake model provider for tests
 - OpenAI-compatible streaming provider
 - a pure agent loop that streams events, executes tools, and grows the transcript
+- a reusable `AgentHarness` that owns transcript state and streams events
 - beginner-friendly design documentation
 
 ## Where to start
@@ -42,3 +43,4 @@ Tau currently has:
 - Want the current core model? Read [Core Types and Events](05-core-types-and-events.md).
 - Want to configure model backends? Read [Providers](providers.md).
 - Want to understand the execution engine? Read [Agent Loop](agent-loop.md).
+- Want the reusable stateful brain? Read [Agent Harness](harness.md).

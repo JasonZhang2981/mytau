@@ -14,6 +14,12 @@ from tau_agent.events import (
     TurnEndEvent,
     TurnStartEvent,
 )
+from tau_agent.harness import (
+    AgentHarness,
+    AgentHarnessConfig,
+    EventListener,
+    SimpleCancellationToken,
+)
 from tau_agent.loop import run_agent_loop
 from tau_agent.messages import AgentMessage, AssistantMessage, ToolResultMessage, UserMessage
 from tau_agent.tools import AgentTool, AgentToolResult, ToolCall, ToolExecutor
@@ -24,16 +30,20 @@ __all__ = [
     "AgentEvent",
     "AgentMessage",
     "AgentStartEvent",
+    "AgentHarness",
+    "AgentHarnessConfig",
     "AgentTool",
     "AgentToolResult",
     "AssistantMessage",
     "ErrorEvent",
+    "EventListener",
     "JSONObject",
     "JSONPrimitive",
     "JSONValue",
     "MessageDeltaEvent",
     "MessageEndEvent",
     "MessageStartEvent",
+    "SimpleCancellationToken",
     "ToolCall",
     "ToolExecutionEndEvent",
     "ToolExecutionStartEvent",
