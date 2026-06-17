@@ -18,6 +18,8 @@ tau_coding   CLI app, resources, skills, extensions, commands, UI integration
 
 The most important boundary is that `tau_agent` should stay portable. It can define the reusable agent brain, but it should not know about VS Code, Textual, Rich rendering, local config directories, slash commands, or project-specific prompts.
 
+For the practical frontend contract, see [Building a Custom TUI](../custom-tui.md).
+
 ## Phase notes
 
 - [Phase 1: Core Types and Events](phase-1-core-types-and-events.md)

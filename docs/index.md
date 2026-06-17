@@ -51,3 +51,4 @@ Tau currently has:
 - Want to configure model backends? Read [Providers](providers.md).
 - Want to understand the execution engine? Read [Agent Loop](agent-loop.md).
 - Want the reusable stateful brain? Read [Agent Harness](harness.md).
+- Want to build another frontend? Read [Building a Custom TUI](custom-tui.md).

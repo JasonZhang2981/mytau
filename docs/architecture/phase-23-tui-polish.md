@@ -28,6 +28,11 @@ The same completion engine now suggests available values for `/model` and
 `/provider` arguments. This gives the prompt a lightweight picker for model and
 provider switching without adding a separate modal UI.
 
+The frontend boundary is now documented in [Building a Custom TUI](../custom-tui.md).
+That guide describes how another terminal UI can consume `CodingSession`,
+`AgentEvent`, `TuiState`, and `TuiEventAdapter` without coupling to Textual
+internals.
+
 ## Boundaries
 
 These changes live in `tau_coding.tui`. The command registry still owns command
