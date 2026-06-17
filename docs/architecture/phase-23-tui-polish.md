@@ -81,6 +81,11 @@ with slim left accents instead of boxed cards. Theme selection feeds Textual CSS
 variables plus Rich transcript/sidebar renderers, so the app chrome and message
 blocks stay visually consistent without adding UI policy to `tau_agent`.
 
+The sidebar is now responsive. It remains visible on medium or larger terminal
+windows, but hides automatically when the terminal is narrow or short so the
+conversation and prompt keep enough room to breathe. The visibility rule lives
+in the Textual frontend; session metadata and agent state are unchanged.
+
 The frontend boundary is now documented in [Building a Custom TUI](../custom-tui.md).
 That guide describes how another terminal UI can consume `CodingSession`,
 `AgentEvent`, `TuiState`, and `TuiEventAdapter` without coupling to Textual

@@ -216,12 +216,63 @@ def test_chat_items_preserve_malformed_fenced_code() -> None:
 async def test_tui_app_mounts_sidebar_and_transcript() -> None:
     app = TauTuiApp(FakeSession())
 
-    async with app.run_test():
+    async with app.run_test(size=(120, 30)):
         assert app.query_one("#sidebar") is not None
         transcript = app.query_one("#transcript")
         assert transcript is not None
         assert transcript.min_width == 1
         assert app.query_one("#prompt") is not None
+
+
+@pytest.mark.anyio
+async def test_tui_sidebar_is_visible_on_medium_windows() -> None:
+    app = TauTuiApp(FakeSession())
+
+    async with app.run_test(size=(120, 30)):
+        sidebar = app.query_one("#sidebar")
+        assert sidebar.display is True
+        assert not app.has_class("-hide-sidebar")
+
+
+@pytest.mark.anyio
+async def test_tui_sidebar_hides_on_narrow_windows() -> None:
+    app = TauTuiApp(FakeSession())
+
+    async with app.run_test(size=(80, 30)):
+        sidebar = app.query_one("#sidebar")
+        assert sidebar.display is False
+        assert app.has_class("-hide-sidebar")
+
+
+@pytest.mark.anyio
+async def test_tui_sidebar_hides_on_short_windows() -> None:
+    app = TauTuiApp(FakeSession())
+
+    async with app.run_test(size=(120, 18)):
+        sidebar = app.query_one("#sidebar")
+        assert sidebar.display is False
+        assert app.has_class("-hide-sidebar")
+
+
+@pytest.mark.anyio
+async def test_tui_sidebar_visibility_updates_on_resize() -> None:
+    app = TauTuiApp(FakeSession())
+
+    async with app.run_test(size=(120, 30)) as pilot:
+        sidebar = app.query_one("#sidebar")
+        assert sidebar.display is True
+
+        await pilot.resize_terminal(width=80, height=30)
+        await pilot.pause()
+        assert sidebar.display is False
+
+        await pilot.resize_terminal(width=120, height=18)
+        await pilot.pause()
+        assert sidebar.display is False
+
+        await pilot.resize_terminal(width=120, height=30)
+        await pilot.pause()
+        assert sidebar.display is True
 
 
 @pytest.mark.anyio

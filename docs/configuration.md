@@ -112,6 +112,9 @@ The built-in themes are:
   conversation rows.
 - `high-contrast`, a sharper dark theme for brighter terminal contrast.
 
+The built-in sidebar is responsive: Tau shows it on medium or larger terminal
+windows and hides it automatically when the terminal is narrow or short.
+
 Any omitted keybinding uses the built-in default. Key names use Textual's key
 syntax, such as `ctrl+k`, `tab`, `down`, `up`, and `f2`. Tau rejects unknown
 themes, unknown keybinding names, empty keys, and duplicate assignments so

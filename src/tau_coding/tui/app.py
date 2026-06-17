@@ -7,7 +7,7 @@ from typing import Any, ClassVar, Literal, Protocol, cast
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingsMap
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.events import Key
+from textual.events import Key, Resize
 from textual.screen import ModalScreen
 from textual.widgets import Footer, Header, Input, Label, ListItem, ListView, Static
 from textual.worker import Worker
@@ -28,6 +28,8 @@ from tau_coding.tui.state import TuiState
 from tau_coding.tui.widgets import SessionSidebar, TranscriptView, render_completion_suggestions
 
 type BindingEntry = Binding | tuple[str, str] | tuple[str, str, str]
+SIDEBAR_MIN_WIDTH = 96
+SIDEBAR_MIN_HEIGHT = 24
 
 
 class CompletionActionTarget(Protocol):
@@ -228,6 +230,14 @@ class TauTuiApp(App[None]):
         border-right: tall $tau-border;
     }
 
+    TauTuiApp.-hide-sidebar #sidebar {
+        display: none;
+    }
+
+    TauTuiApp.-hide-sidebar #main-pane {
+        padding-left: 1;
+    }
+
     #main-pane {
         width: 1fr;
         padding: 1 1 0 1;
@@ -378,8 +388,13 @@ class TauTuiApp(App[None]):
     async def on_mount(self) -> None:
         """Focus the prompt when the app starts."""
         self.query_one(Input).focus()
+        self._update_responsive_layout(self.size.width, self.size.height)
         self._refresh()
         self._refresh_completions()
+
+    def on_resize(self, event: Resize) -> None:
+        """Update responsive chrome when the terminal changes size."""
+        self._update_responsive_layout(event.size.width, event.size.height)
 
     def on_input_changed(self, event: Input.Changed) -> None:
         """Update prompt autocomplete when the input value changes."""
@@ -560,6 +575,10 @@ class TauTuiApp(App[None]):
                 theme=self.tui_settings.resolved_theme,
             )
         )
+
+    def _update_responsive_layout(self, width: int, height: int) -> None:
+        show_sidebar = width >= SIDEBAR_MIN_WIDTH and height >= SIDEBAR_MIN_HEIGHT
+        self.set_class(not show_sidebar, "-hide-sidebar")
 
     def _build_completion_state(self, text: str) -> CompletionState:
         registry = _session_command_registry(self.session)
