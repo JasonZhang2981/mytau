@@ -8,12 +8,8 @@ from textual.widgets import Footer, Header, Input, Static
 from textual.worker import Worker
 
 from tau_ai import OpenAICompatibleProvider, openai_compatible_config_from_env
-from tau_coding.session import (
-    CodingSession,
-    CodingSessionConfig,
-    default_session_path,
-    jsonl_session_storage,
-)
+from tau_coding.session import CodingSession, CodingSessionConfig, jsonl_session_storage
+from tau_coding.session_manager import SessionManager
 from tau_coding.tui.adapter import TuiEventAdapter
 from tau_coding.tui.state import TuiState
 from tau_coding.tui.widgets import SessionSidebar, TranscriptView
@@ -164,16 +160,36 @@ class TauTuiApp(App[None]):
         status.update("Working…" if self.state.running else "Ready")
 
 
-async def run_tui_app(*, model: str, cwd: Path) -> None:
+async def run_tui_app(
+    *,
+    model: str,
+    cwd: Path,
+    session_id: str | None = None,
+    new_session: bool = False,
+    session_manager: SessionManager | None = None,
+) -> None:
     """Create the default provider/session and run the Textual app."""
     provider = OpenAICompatibleProvider(openai_compatible_config_from_env())
+    manager = session_manager or SessionManager()
     try:
+        if new_session:
+            record = manager.create_session(cwd=cwd, model=model)
+        elif session_id is not None:
+            existing_record = manager.get_session(session_id)
+            if existing_record is None:
+                raise RuntimeError(f"Unknown session: {session_id}")
+            record = existing_record
+        else:
+            record = manager.get_or_create_default_session(cwd=cwd, model=model)
+
         session = await CodingSession.load(
             CodingSessionConfig(
                 provider=provider,
-                model=model,
-                cwd=cwd,
-                storage=jsonl_session_storage(default_session_path(cwd)),
+                model=record.model or model,
+                cwd=record.cwd,
+                storage=jsonl_session_storage(record.path),
+                session_id=record.id,
+                session_manager=manager,
             )
         )
         app = TauTuiApp(session)

@@ -11,7 +11,7 @@ from tau_ai import (
     ProviderResponseStartEvent,
     ProviderTextDeltaEvent,
 )
-from tau_coding import cli
+from tau_coding import CodingSessionRecord, cli
 from tau_coding.cli import app, run_print_mode
 from tau_coding.rendering import PrintOutputMode
 from tau_coding.resources import TauResourcePaths
@@ -160,14 +160,67 @@ def test_cli_exits_nonzero_when_print_mode_fails(monkeypatch: pytest.MonkeyPatch
 
 
 def test_tui_command_invokes_tui_runner(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    calls: list[tuple[str, Path]] = []
+    calls: list[tuple[str, Path, str | None, bool]] = []
 
-    async def fake_run_openai_tui(model: str, cwd: Path) -> None:
-        calls.append((model, cwd))
+    async def fake_run_openai_tui(
+        model: str, cwd: Path, session_id: str | None, new_session: bool
+    ) -> None:
+        calls.append((model, cwd, session_id, new_session))
 
     monkeypatch.setattr(cli, "run_openai_tui", fake_run_openai_tui)
 
-    result = CliRunner().invoke(app, ["--cwd", str(tmp_path), "--model", "fake", "tui"])
+    result = CliRunner().invoke(
+        app,
+        [
+            "--cwd",
+            str(tmp_path),
+            "--model",
+            "fake",
+            "--resume",
+            "session-1",
+            "--new-session",
+            "tui",
+        ],
+    )
 
     assert result.exit_code == 0
-    assert calls == [("fake", tmp_path)]
+    assert calls == [("fake", tmp_path, "session-1", True)]
+
+
+def test_sessions_command_lists_indexed_sessions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    record = CodingSessionRecord(
+        id="session-1",
+        path=tmp_path / "session.jsonl",
+        cwd=tmp_path,
+        model="fake",
+        title="Test session",
+        created_at=1.0,
+        updated_at=2.0,
+    )
+
+    class FakeSessionManager:
+        def list_sessions(self) -> list[CodingSessionRecord]:
+            return [record]
+
+    monkeypatch.setattr(cli, "SessionManager", FakeSessionManager)
+
+    result = CliRunner().invoke(app, ["sessions"])
+
+    assert result.exit_code == 0
+    assert "session-1" in result.stdout
+    assert "Test session" in result.stdout
+
+
+def test_sessions_command_handles_empty_index(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeSessionManager:
+        def list_sessions(self) -> list[CodingSessionRecord]:
+            return []
+
+    monkeypatch.setattr(cli, "SessionManager", FakeSessionManager)
+
+    result = CliRunner().invoke(app, ["sessions"])
+
+    assert result.exit_code == 0
+    assert "No sessions found." in result.stdout

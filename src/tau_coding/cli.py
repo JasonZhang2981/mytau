@@ -11,6 +11,7 @@ from tau_ai import ModelProvider, OpenAICompatibleProvider, openai_compatible_co
 from tau_coding import __version__, create_coding_tools, load_skills
 from tau_coding.rendering import PrintOutputMode, create_event_renderer
 from tau_coding.resources import TauResourcePaths
+from tau_coding.session_manager import CodingSessionRecord, SessionManager
 from tau_coding.system_prompt import BuildSystemPromptOptions, build_system_prompt
 from tau_coding.tui import run_tui_app
 
@@ -46,6 +47,14 @@ def main(
         PrintOutputMode,
         typer.Option("--output", "-o", help="Output mode for print mode."),
     ] = PrintOutputMode.text,
+    resume: Annotated[
+        str | None,
+        typer.Option("--resume", help="Resume a session id in TUI mode."),
+    ] = None,
+    new_session: Annotated[
+        bool,
+        typer.Option("--new-session", help="Create a new session in TUI mode."),
+    ] = False,
     version: Annotated[
         bool,
         typer.Option("--version", help="Show Tau's version and exit."),
@@ -59,9 +68,13 @@ def main(
     if ctx.invoked_subcommand is not None:
         return
 
+    if prompt_option is None and prompt_arg == "sessions":
+        render_session_list(SessionManager().list_sessions())
+        raise typer.Exit()
+
     if prompt_option is None and prompt_arg == "tui":
         try:
-            anyio.run(run_openai_tui, model, cwd or Path.cwd())
+            anyio.run(run_openai_tui, model, cwd or Path.cwd(), resume, new_session)
         except RuntimeError as exc:
             raise typer.BadParameter(str(exc)) from exc
         raise typer.Exit()
@@ -79,9 +92,22 @@ def main(
         raise typer.Exit(1)
 
 
-async def run_openai_tui(model: str, cwd: Path) -> None:
+async def run_openai_tui(
+    model: str, cwd: Path, session_id: str | None = None, new_session: bool = False
+) -> None:
     """Run the Textual TUI with the default OpenAI-compatible provider."""
-    await run_tui_app(model=model, cwd=cwd)
+    await run_tui_app(model=model, cwd=cwd, session_id=session_id, new_session=new_session)
+
+
+def render_session_list(records: list[CodingSessionRecord]) -> None:
+    """Render indexed sessions for the CLI."""
+    if not records:
+        typer.echo("No sessions found.")
+        return
+
+    for record in records:
+        title = record.title or "Untitled"
+        typer.echo(f"{record.id}\t{title}\t{record.model}\t{record.cwd}")
 
 
 async def run_openai_print_mode(
