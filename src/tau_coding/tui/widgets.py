@@ -2,7 +2,6 @@
 
 from collections.abc import Sequence
 from pathlib import Path
-from re import search
 from subprocess import TimeoutExpired, run
 from typing import Any, Protocol
 
@@ -271,6 +270,15 @@ def _render_chat_body(
     )
     if patch_body is not None:
         return patch_body
+    if role == "assistant":
+        if _has_unclosed_fence(text):
+            return _plain_text(text, body_style=body_style)
+        return Markdown(
+            text,
+            style=body_style,
+            code_theme=syntax_theme,
+            inline_code_theme=syntax_theme,
+        )
     fenced_body = _render_fenced_body(
         text,
         body_style=body_style,
@@ -280,13 +288,6 @@ def _render_chat_body(
         return fenced_body
     if "```" in text:
         return _plain_text(text, body_style=body_style)
-    if role == "assistant" and _looks_like_markdown(text):
-        return Markdown(
-            text,
-            style=body_style,
-            code_theme=syntax_theme,
-            inline_code_theme=syntax_theme,
-        )
     return _plain_text(text, body_style=body_style)
 
 
@@ -414,12 +415,9 @@ def _git_branch(cwd: Path) -> str:
     return "--"
 
 
-def _looks_like_markdown(text: str) -> bool:
-    return search(
-        r"(?m)(^#{1,6}\s+\S|^\s*[-*+]\s+\S|^\s*\d+\.\s+\S|^>\s+\S|"
-        r"`[^`\n]+`|\*\*[^*\n]+\*\*|\[[^\]\n]+\]\([^)]+\))",
-        text,
-    ) is not None
+def _has_unclosed_fence(text: str) -> bool:
+    fence_count = sum(1 for line in text.splitlines() if line.startswith("```"))
+    return fence_count % 2 == 1
 
 
 def _fence_language(raw: str) -> str:

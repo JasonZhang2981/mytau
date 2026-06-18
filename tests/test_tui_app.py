@@ -269,6 +269,23 @@ def test_assistant_chat_items_render_markdown_lists() -> None:
     assert "- inspect" not in output
 
 
+def test_assistant_chat_items_render_markdown_tables() -> None:
+    console = Console(record=True, width=60)
+    item = ChatItem(
+        role="assistant",
+        text="| File | Status |\n| --- | --- |\n| README.md | updated |",
+    )
+
+    console.print(render_chat_item(item))
+    output = console.export_text()
+
+    assert "File" in output
+    assert "Status" in output
+    assert "README.md" in output
+    assert "updated" in output
+    assert "---" not in output
+
+
 def test_user_chat_items_keep_markdown_literal() -> None:
     console = Console(record=True, width=60)
     item = ChatItem(role="user", text="- keep this literal")
