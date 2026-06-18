@@ -22,6 +22,7 @@ from textual.widgets import RichLog, Static
 from tau_agent.tools import AgentTool
 from tau_coding.prompt_templates import PromptTemplate
 from tau_coding.skills import Skill
+from tau_coding.system_prompt import ProjectContextFile
 from tau_coding.tui.autocomplete import CompletionState
 from tau_coding.tui.config import TAU_DARK_THEME, TuiRoleStyle, TuiTheme
 from tau_coding.tui.state import ChatItem, TuiState
@@ -55,6 +56,9 @@ class SessionSummarySource(Protocol):
 
     @property
     def prompt_templates(self) -> Sequence[PromptTemplate]: ...
+
+    @property
+    def context_files(self) -> Sequence[ProjectContextFile]: ...
 
     @property
     def context_token_estimate(self) -> int: ...
@@ -181,6 +185,11 @@ def render_session_sidebar(
         empty="No prompt templates",
         theme=theme,
     )
+    context = _bullet_list(
+        _context_file_labels(session.context_files, cwd=session.cwd),
+        empty="No context files",
+        theme=theme,
+    )
     logo = Text(TAU_SIDEBAR_LOGO, style=f"bold {theme.prompt_text}")
 
     return Group(
@@ -188,6 +197,13 @@ def render_session_sidebar(
         Panel(
             metadata,
             title="session",
+            box=box.SQUARE,
+            border_style=theme.border,
+            padding=(0, 1),
+        ),
+        Panel(
+            context,
+            title="context",
             box=box.SQUARE,
             border_style=theme.border,
             padding=(0, 1),
@@ -515,6 +531,24 @@ def _compact_token_count(value: int) -> str:
     if value < 1000:
         return "<1k"
     return f"{(value + 500) // 1000}k"
+
+
+def _context_file_labels(
+    context_files: Sequence[ProjectContextFile],
+    *,
+    cwd: Path,
+) -> list[str]:
+    return [_context_file_label(Path(context_file.path), cwd=cwd) for context_file in context_files]
+
+
+def _context_file_label(path: Path, *, cwd: Path) -> str:
+    expanded_path = path.expanduser()
+    if not expanded_path.is_absolute():
+        expanded_path = cwd / expanded_path
+    try:
+        return str(expanded_path.resolve().relative_to(cwd.expanduser().resolve()))
+    except (OSError, ValueError):
+        return _short_path(expanded_path)
 
 
 def _thinking_level(session: SessionSummarySource) -> str:
