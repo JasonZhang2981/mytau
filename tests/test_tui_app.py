@@ -875,6 +875,19 @@ async def test_tui_prompt_worker_refreshes_directly() -> None:
 
 
 @pytest.mark.anyio
+async def test_tui_app_runs_initial_prompt() -> None:
+    session = FakeSession(events=[AgentStartEvent(), AgentEndEvent()])
+    app = TauTuiApp(session, initial_prompt="explain this repo")
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.pause()
+
+    assert session.prompt_texts == ["explain this repo"]
+    assert any(item.role == "user" and item.text == "explain this repo" for item in app.state.items)
+
+
+@pytest.mark.anyio
 async def test_run_tui_app_creates_new_session_by_default(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -917,6 +930,7 @@ async def test_run_tui_app_creates_new_session_by_default(
         def __init__(self, session: str, **kwargs: object) -> None:
             assert session == "session"
             assert isinstance(kwargs["tui_settings"], TuiSettings)
+            assert kwargs["initial_prompt"] == "explain this repo"
 
         async def run_async(self) -> None:
             calls.append("run")
@@ -943,6 +957,7 @@ async def test_run_tui_app_creates_new_session_by_default(
         cwd=tmp_path,
         provider_name="local",
         auto_compact_token_threshold=1000,
+        initial_prompt="explain this repo",
         session_manager=FakeManager(),
     )
 

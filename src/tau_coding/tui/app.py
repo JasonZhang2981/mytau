@@ -746,9 +746,11 @@ class TauTuiApp(App[None]):
         *,
         tui_settings: TuiSettings | None = None,
         startup_message: str | None = None,
+        initial_prompt: str | None = None,
     ) -> None:
         self.tui_settings = tui_settings or TuiSettings()
         self.startup_message = startup_message
+        self.initial_prompt = initial_prompt
         super().__init__()
         self._bindings = BindingsMap(_app_bindings(self.tui_settings.keybindings))
         self.session = session
@@ -794,6 +796,8 @@ class TauTuiApp(App[None]):
         self._refresh_completions()
         if self.startup_message:
             self._notify(self.startup_message, severity="warning")
+        if self.initial_prompt and self.initial_prompt.strip():
+            self._submit_prompt(self.initial_prompt.strip())
 
     def on_resize(self, event: Resize) -> None:
         """Update responsive chrome when the terminal changes size."""
@@ -855,6 +859,10 @@ class TauTuiApp(App[None]):
             self._notify("Tau is already working. Press Escape to cancel.")
             return
 
+        self._submit_prompt(text)
+
+    def _submit_prompt(self, text: str) -> None:
+        """Add a prompt to the transcript and start the agent worker."""
         self.state.add_item("user", text)
         self._refresh()
         self._prompt_worker = self.run_worker(self._run_prompt(text), exclusive=True)
@@ -1225,6 +1233,7 @@ async def run_tui_app(
     new_session: bool = False,
     provider_name: str | None = None,
     auto_compact_token_threshold: int | None = None,
+    initial_prompt: str | None = None,
     session_manager: SessionManager | None = None,
 ) -> None:
     """Create the default provider/session and run the Textual app."""
@@ -1274,6 +1283,7 @@ async def run_tui_app(
             session,
             tui_settings=load_tui_settings(),
             startup_message=startup_message,
+            initial_prompt=initial_prompt,
         )
         await app.run_async()
     finally:

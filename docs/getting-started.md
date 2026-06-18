@@ -80,13 +80,21 @@ tau
 
 Tau stores indexed sessions under `~/.tau/sessions/`.
 
-## Run One Prompt
+## Run an Initial Prompt in the TUI
 
 ```bash
 uv run tau "explain this repository"
 ```
 
-One-shot print-mode prompts are non-interactive, but they still use the shared
+This opens the interactive TUI and submits the prompt as the first turn.
+
+For a one-shot print-mode prompt, use `-p`:
+
+```bash
+uv run tau -p "explain this repository"
+```
+
+Print-mode prompts are non-interactive, but they still use the shared
 coding-session environment. Tau stores their session entries under
 `~/.tau/sessions/`.
 

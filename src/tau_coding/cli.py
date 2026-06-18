@@ -82,7 +82,7 @@ def main(
     ctx: typer.Context,
     prompt_arg: Annotated[
         str | None,
-        typer.Argument(help="Prompt to run in non-interactive print mode."),
+        typer.Argument(help="Initial prompt to run in interactive TUI mode."),
     ] = None,
     prompt_option: Annotated[
         str | None,
@@ -183,7 +183,7 @@ def main(
         )
         raise typer.Exit()
 
-    if prompt_option is None and prompt_arg is None:
+    if prompt_option is None:
         try:
             anyio.run(
                 run_openai_tui,
@@ -193,14 +193,15 @@ def main(
                 new_session,
                 provider,
                 auto_compact_threshold,
+                prompt_arg,
             )
         except RuntimeError as exc:
             raise typer.BadParameter(str(exc)) from exc
         raise typer.Exit()
 
-    prompt = prompt_option or prompt_arg
+    prompt = prompt_option
     if prompt is None:
-        raise AssertionError("prompt should be set outside TUI mode")
+        raise AssertionError("prompt option should be set outside TUI mode")
 
     try:
         ok = anyio.run(run_openai_print_mode, prompt, model, cwd or Path.cwd(), output, provider)
@@ -217,6 +218,7 @@ async def run_openai_tui(
     new_session: bool = False,
     provider_name: str | None = None,
     auto_compact_token_threshold: int | None = None,
+    initial_prompt: str | None = None,
 ) -> None:
     """Run the Textual TUI with the default OpenAI-compatible provider."""
     await run_tui_app(
@@ -226,6 +228,7 @@ async def run_openai_tui(
         new_session=new_session,
         provider_name=provider_name,
         auto_compact_token_threshold=auto_compact_token_threshold,
+        initial_prompt=initial_prompt,
     )
 
 

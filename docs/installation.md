@@ -36,10 +36,17 @@ Tau starts the interactive Textual TUI when no prompt is provided:
 tau
 ```
 
-For a one-shot print-mode prompt:
+Passing a positional prompt also starts the TUI and submits that prompt as the
+first turn:
 
 ```bash
 tau "explain this repository"
+```
+
+For a one-shot print-mode prompt:
+
+```bash
+tau -p "explain this repository"
 ```
 
 Print-mode prompts create indexed session entries under `~/.tau/sessions/` while

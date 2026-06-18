@@ -13,12 +13,20 @@ src/tau_coding/cli.py
 
 ## What was added
 
-The `tau` command can now run a single prompt in print mode:
+The `tau` command can run a single prompt in print mode with `-p`/`--prompt`:
 
 ```bash
-tau "explain this repo"
 tau -p "write tests for main.py"
-tau --model gpt-4.1-mini "summarize README.md"
+tau --prompt "explain this repo"
+tau --model gpt-5.5 -p "summarize README.md"
+```
+
+Without `-p`/`--prompt`, Tau starts the interactive TUI. A positional prompt is
+treated as the initial TUI prompt:
+
+```bash
+tau
+tau "explain this repo"
 ```
 
 The original Phase 6 command:
@@ -32,9 +40,10 @@ The original Phase 6 command:
 
 ## Provider configuration
 
-Print mode currently uses the OpenAI-compatible provider.
+Print mode uses Tau's configured provider settings.
 
-Required environment:
+If no provider login has been saved, the default OpenAI-compatible provider
+expects:
 
 ```bash
 export OPENAI_API_KEY="..."
@@ -49,7 +58,7 @@ export OPENAI_BASE_URL="https://api.openai.com/v1"
 The default model is currently:
 
 ```text
-gpt-4.1-mini
+gpt-5.5
 ```
 
 Use `--model` to choose another model supported by the configured endpoint.
@@ -61,7 +70,7 @@ Tools are rooted at the current working directory by default.
 Use `--cwd` to run tools somewhere else:
 
 ```bash
-tau --cwd /path/to/project "inspect the tests"
+tau --cwd /path/to/project -p "inspect the tests"
 ```
 
 ## Current behavior
@@ -104,7 +113,8 @@ no CLI, Rich, Textual, config-file, or session-storage dependency.
 The phase is covered by `tests/test_cli.py`, including:
 
 - `tau --version`
-- default TUI launch when no prompt is provided
+- default TUI launch when no print-mode prompt is provided
+- positional prompts launching the TUI as initial prompts
 - shared system prompt contents
 - print-mode streaming with a fake provider
 - print-mode session persistence

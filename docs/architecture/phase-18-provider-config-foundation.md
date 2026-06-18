@@ -99,9 +99,10 @@ tau --provider local \
 ```
 
 The setup options are top-level options before the `setup` command word. This
-preserves the Pi-style `tau "prompt"` form while still adding a lightweight
-setup flow. Setup writes provider metadata only; it warns if the named API key
-environment variable is not currently set.
+preserves the Pi-style `tau "prompt"` form for starting the TUI with an initial
+prompt while still adding a lightweight setup flow. Setup writes provider
+metadata only; it warns if the named API key environment variable is not
+currently set.
 
 Provider HTTP timeouts are configurable through `timeout_seconds` in
 `~/.tau/providers.json`. The default OpenAI-compatible provider can also read

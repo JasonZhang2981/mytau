@@ -88,8 +88,12 @@ Run Tau with a configured provider:
 
 ```bash
 tau --provider local
-tau "summarize this project" --provider local
+tau --provider local "summarize this project"
+tau --provider local -p "summarize this project"
 ```
+
+The positional prompt starts the TUI with an initial prompt. The `-p` form runs
+non-interactive print mode.
 
 Inside the TUI:
 
