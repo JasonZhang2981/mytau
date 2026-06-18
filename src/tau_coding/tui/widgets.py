@@ -249,11 +249,20 @@ def render_chat_item(
 ) -> RenderableType:
     """Render a chat item as a standalone Toad-inspired transcript block."""
     role_style = _chat_item_role_style(item, theme)
-    body = _render_chat_body(
-        _visible_chat_text(item, show_tool_results=show_tool_results),
-        role=item.role,
-        body_style=role_style.body,
-        syntax_theme=theme.syntax_theme,
+    body = (
+        _render_tool_chat_body(
+            item,
+            body_style=theme.role_styles["tool"].body,
+            accent_style=_tool_accent_style(item),
+            show_tool_results=show_tool_results,
+        )
+        if item.role == "tool"
+        else _render_chat_body(
+            _visible_chat_text(item, show_tool_results=show_tool_results),
+            role=item.role,
+            body_style=role_style.body,
+            syntax_theme=theme.syntax_theme,
+        )
     )
     table = Table.grid(expand=True)
     table.add_column(width=1, style=role_style.border)
@@ -268,10 +277,55 @@ def render_chat_item(
 def _chat_item_role_style(item: ChatItem, theme: TuiTheme) -> TuiRoleStyle:
     if item.role == "tool" and item.tool_result_text:
         if item.tool_result_text.startswith("✓"):
-            return TuiRoleStyle(border="#9cffb1", body="#9cffb1 on #000000")
+            return TuiRoleStyle(border="#9cffb1", body=theme.role_styles["tool"].body)
         if item.tool_result_text.startswith("✗"):
-            return TuiRoleStyle(border="#ff4f4f", body="#ff4f4f on #000000")
+            return TuiRoleStyle(border="#ff4f4f", body=theme.role_styles["tool"].body)
     return theme.role_styles[item.role]
+
+
+def _tool_accent_style(item: ChatItem) -> str | None:
+    if item.role != "tool" or not item.tool_result_text:
+        return None
+    if item.tool_result_text.startswith("✓"):
+        return "#9cffb1 on #000000"
+    if item.tool_result_text.startswith("✗"):
+        return "#ff4f4f on #000000"
+    return None
+
+
+def _render_tool_chat_body(
+    item: ChatItem,
+    *,
+    body_style: str,
+    accent_style: str | None,
+    show_tool_results: bool,
+) -> Text:
+    text = _render_tool_invocation(item.text, body_style=body_style, accent_style=accent_style)
+    if show_tool_results and item.tool_result_text:
+        text.append("\n\n")
+        text.append(item.tool_result_text, style=body_style)
+    return text
+
+
+def _render_tool_invocation(text: str, *, body_style: str, accent_style: str | None) -> Text:
+    rendered = Text(style=body_style, overflow="fold", no_wrap=False)
+    accent_style = accent_style or body_style
+    prefix, name, remainder = _split_tool_invocation(text)
+    rendered.append(prefix, style=body_style)
+    rendered.append(name, style=body_style)
+    rendered.append(remainder, style=accent_style)
+    return rendered
+
+
+def _split_tool_invocation(text: str) -> tuple[str, str, str]:
+    if text.startswith("→ "):
+        rest = text[2:]
+        name, separator, remainder = rest.partition(" ")
+        return "→ ", name, f"{separator}{remainder}" if separator else ""
+    if text.startswith("$ "):
+        return "$", "", text[1:]
+    name, separator, remainder = text.partition(" ")
+    return "", name, f"{separator}{remainder}" if separator else ""
 
 
 def _visible_chat_text(item: ChatItem, *, show_tool_results: bool) -> str:

@@ -306,23 +306,39 @@ def test_tool_chat_items_hide_and_show_result_text() -> None:
     assert "full file contents" in expanded
 
 
-def test_tool_chat_items_color_success_and_error_status() -> None:
+def test_tool_chat_items_color_status_metadata_not_tool_name_or_results() -> None:
     success_console = Console(record=True, width=80)
     success_console.print(
         render_chat_item(
-            ChatItem(role="tool", text="→ read README.md", tool_result_text="✓ read\ncontents")
+            ChatItem(role="tool", text="→ read README.md", tool_result_text="✓ read\ncontents"),
+            show_tool_results=True,
         )
     )
     success_output = success_console.export_text(styles=True)
 
     error_console = Console(record=True, width=80)
     error_console.print(
-        render_chat_item(ChatItem(role="tool", text="$ false", tool_result_text="✗ bash\nfailed"))
+        render_chat_item(
+            ChatItem(role="tool", text="$ false", tool_result_text="✗ bash\nfailed"),
+            show_tool_results=True,
+        )
     )
     error_output = error_console.export_text(styles=True)
 
-    assert "38;2;156;255;177" in success_output
-    assert "38;2;255;79;79" in error_output
+    green = "38;2;156;255;177"
+    red = "38;2;255;79;79"
+    white = "38;2;203;213;225"
+
+    assert green in success_output
+    assert f"{white};48;2;0;0;0mread" in success_output
+    assert f"{green};48;2;0;0;0mread" not in success_output
+    assert f"{green};48;2;0;0;0m✓ read" not in success_output
+    assert f"{green};48;2;0;0;0mcontents" not in success_output
+
+    assert red in error_output
+    assert f"{white};48;2;0;0;0m✗ bash" in error_output
+    assert f"{red};48;2;0;0;0m✗ bash" not in error_output
+    assert f"{red};48;2;0;0;0mfailed" not in error_output
 
 
 def test_assistant_chat_items_render_markdown_lists() -> None:
