@@ -841,8 +841,14 @@ async def test_tui_model_opens_interactive_picker() -> None:
             "  local:local-model",
         ]
 
-        await pilot.press("down")
-        await pilot.press("down")
+        search = app.screen.query_one("#model-picker-search", Input)
+        assert search.has_focus
+        search.value = "local"
+        await pilot.pause()
+
+        labels = [str(item.query_one(Label).render()) for item in model_list.children]
+        assert labels == ["  local:local-model"]
+
         await pilot.press("enter")
         await pilot.pause()
 

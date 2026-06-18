@@ -337,6 +337,7 @@ class ModelPickerScreen(ModalScreen[ModelChoice | None]):
     ) -> None:
         super().__init__()
         self.choices = tuple(dict.fromkeys(choices))
+        self.visible_choices = self.choices
         self.current_model = current_model
         self.provider_name = provider_name
         self.theme = theme
@@ -345,6 +346,7 @@ class ModelPickerScreen(ModalScreen[ModelChoice | None]):
         """Compose the model picker."""
         with Vertical(id="model-picker"):
             yield Static(f"Model: {self.provider_name}", id="model-picker-title")
+            yield Input(placeholder="Search models", id="model-picker-search")
             yield ListView(
                 *[
                     ListItem(
@@ -364,15 +366,61 @@ class ModelPickerScreen(ModalScreen[ModelChoice | None]):
             yield Static("Enter selects - Escape closes", id="model-picker-help")
 
     def on_mount(self) -> None:
-        """Focus the model list."""
+        """Focus the search field."""
+        search = self.query_one("#model-picker-search", Input)
+        search.focus()
+        self._reset_model_list_index()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """Filter model choices as the search value changes."""
+        if event.input.id != "model-picker-search":
+            return
+        event.stop()
+        self.visible_choices = _filter_model_choices(self.choices, event.value)
         model_list = self.query_one("#model-picker-list", ListView)
+        model_list.clear()
+        model_list.extend(
+            [
+                ListItem(
+                    Label(
+                        _model_picker_label(
+                            choice,
+                            current_model=self.current_model,
+                            current_provider=self.provider_name,
+                        ),
+                        markup=False,
+                    )
+                )
+                for choice in self.visible_choices
+            ]
+        )
+        self._reset_model_list_index()
+        help_text = (
+            "No matching models"
+            if not self.visible_choices
+            else "Enter selects - Escape closes"
+        )
+        self.query_one("#model-picker-help", Static).update(help_text)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Select the highlighted model from the search field."""
+        if event.input.id != "model-picker-search":
+            return
+        event.stop()
+        self.action_select_cursor()
+
+    def _reset_model_list_index(self) -> None:
+        """Move selection to the current model or first visible row."""
+        model_list = self.query_one("#model-picker-list", ListView)
+        if not self.visible_choices:
+            model_list.index = None
+            return
         try:
-            model_list.index = self.choices.index(
+            model_list.index = self.visible_choices.index(
                 ModelChoice(provider_name=self.provider_name, model=self.current_model)
             )
         except ValueError:
             model_list.index = 0
-        model_list.focus()
 
     def on_key(self, event: Key) -> None:
         """Route model picker keys to the list."""
@@ -388,7 +436,7 @@ class ModelPickerScreen(ModalScreen[ModelChoice | None]):
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         """Dismiss with the selected model name."""
-        self.dismiss(self.choices[event.index])
+        self.dismiss(self.visible_choices[event.index])
 
     def action_cursor_up(self) -> None:
         """Move to the previous model."""
@@ -400,6 +448,8 @@ class ModelPickerScreen(ModalScreen[ModelChoice | None]):
 
     def action_select_cursor(self) -> None:
         """Select the highlighted model."""
+        if not self.visible_choices:
+            return
         self.query_one("#model-picker-list", ListView).action_select_cursor()
 
     def action_cancel(self) -> None:
@@ -633,6 +683,14 @@ class TauTuiApp(App[None]):
         max-height: 12;
         background: $tau-transcript-background;
         border: tall $tau-border;
+    }
+
+    #model-picker-search {
+        height: 3;
+        margin-bottom: 1;
+        background: $tau-prompt-background;
+        color: $tau-prompt-text;
+        border: tall $tau-prompt-border;
     }
 
     #login-provider-help,
@@ -1084,6 +1142,19 @@ def _model_picker_label(
         choice.provider_name == current_provider and choice.model == current_model
     ) else "  "
     return f"{marker}{choice.provider_name}:{choice.model}"
+
+
+def _filter_model_choices(
+    choices: Sequence[ModelChoice], query: str
+) -> tuple[ModelChoice, ...]:
+    normalized = query.strip().lower()
+    if not normalized:
+        return tuple(choices)
+    return tuple(
+        choice
+        for choice in choices
+        if normalized in choice.provider_name.lower() or normalized in choice.model.lower()
+    )
 
 
 def _command_output_title(command_text: str) -> str:
