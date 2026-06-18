@@ -47,7 +47,7 @@ submitting the prompt, matching common terminal picker behavior.
 
 Slash-command output is now transient UI instead of transcript content. Short
 command results use Textual notifications, and multi-line output such as
-`/help`, `/skills`, `/sessions`, `/status`, `/resources`, and `/context` opens a
+`/help`, `/skills`, `/resume`, `/status`, `/resources`, and `/context` opens a
 dismissible modal. This keeps command reference material out of the agent
 conversation while preserving access to the information.
 

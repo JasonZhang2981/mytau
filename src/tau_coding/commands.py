@@ -71,6 +71,7 @@ class CommandResult:
     handled: bool
     exit_requested: bool = False
     clear_requested: bool = False
+    new_session_requested: bool = False
     compact_summary: str | None = None
     resume_session_id: str | None = None
     login_picker_requested: bool = False
@@ -102,6 +103,7 @@ class SlashCommand:
     usage: str
     handler: CommandHandler
     aliases: tuple[str, ...] = ()
+    search_terms: tuple[str, ...] = ()
 
 
 class CommandRegistry:
@@ -178,10 +180,11 @@ def create_default_command_registry() -> CommandRegistry:
     )
     registry.register(
         SlashCommand(
-            name="clear",
-            usage="/clear",
-            description="Clear the visible transcript without deleting session history.",
-            handler=_clear_command,
+            name="new",
+            usage="/new",
+            description="Start a new session.",
+            handler=_new_command,
+            search_terms=("clear", "reset"),
         )
     )
     registry.register(
@@ -242,18 +245,11 @@ def create_default_command_registry() -> CommandRegistry:
     )
     registry.register(
         SlashCommand(
-            name="sessions",
-            usage="/sessions",
-            description="List indexed sessions.",
-            handler=_sessions_command,
-        )
-    )
-    registry.register(
-        SlashCommand(
             name="resume",
-            usage="/resume <session-id>",
-            description="Resume an indexed session in the TUI.",
+            usage="/resume [session-id]",
+            description="Resume a previous session.",
             handler=_resume_command,
+            search_terms=("sessions", "history", "previous"),
         )
     )
     registry.register(
@@ -286,8 +282,8 @@ def _exit_command(context: CommandContext) -> CommandResult:
     return CommandResult(handled=True, exit_requested=True, message="Exiting session.")
 
 
-def _clear_command(context: CommandContext) -> CommandResult:
-    return CommandResult(handled=True, clear_requested=True, message="Transcript cleared.")
+def _new_command(context: CommandContext) -> CommandResult:
+    return CommandResult(handled=True, new_session_requested=True)
 
 
 def _compact_command(context: CommandContext) -> CommandResult:
@@ -399,24 +395,9 @@ def _skill_command(context: CommandContext) -> CommandResult:
     )
 
 
-def _sessions_command(context: CommandContext) -> CommandResult:
-    manager = context.session.session_manager
-    if manager is None:
-        return CommandResult(handled=True, message="Session manager is not available.")
-
-    records = manager.list_sessions()
-    if not records:
-        return CommandResult(handled=True, message="No sessions found.")
-
-    lines = ["Indexed sessions:"]
-    for record in records:
-        lines.append(_format_session_record(record))
-    return CommandResult(handled=True, message="\n".join(lines))
-
-
 def _resume_command(context: CommandContext) -> CommandResult:
     if not context.args:
-        return CommandResult(handled=True, message="Usage: /resume <session-id>")
+        return CommandResult(handled=True, message=_format_sessions(context))
     manager = context.session.session_manager
     if manager is None:
         return CommandResult(handled=True, message="Session manager is not available.")
@@ -427,6 +408,21 @@ def _resume_command(context: CommandContext) -> CommandResult:
         handled=True,
         resume_session_id=session_id,
     )
+
+
+def _format_sessions(context: CommandContext) -> str:
+    manager = context.session.session_manager
+    if manager is None:
+        return "Session manager is not available."
+
+    records = manager.list_sessions()
+    if not records:
+        return "No sessions found."
+
+    lines = ["Indexed sessions:"]
+    for record in records:
+        lines.append(_format_session_record(record))
+    return "\n".join(lines)
 
 
 def _model_command(context: CommandContext) -> CommandResult:

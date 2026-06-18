@@ -834,6 +834,8 @@ class TauTuiApp(App[None]):
         if command.handled:
             if command.clear_requested:
                 self.state.clear()
+            if command.new_session_requested:
+                await self._new_session()
             if command.compact_summary is not None:
                 try:
                     compact_message = await self.session.compact(command.compact_summary)
@@ -955,6 +957,20 @@ class TauTuiApp(App[None]):
             self.state.clear()
             self.state.load_messages(self.session.messages)
             self._notify(resume_message)
+        except Exception as exc:  # noqa: BLE001 - surface command failures in the TUI
+            self._notify(f"Error: {exc}", severity="error")
+        self._refresh()
+
+    async def _new_session(self) -> None:
+        new_session = getattr(self.session, "new_session", None)
+        if new_session is None:
+            self._notify("Session manager is not available.")
+            return
+        try:
+            message = await new_session()
+            self.state.clear()
+            self.state.load_messages(self.session.messages)
+            self._notify(message)
         except Exception as exc:  # noqa: BLE001 - surface command failures in the TUI
             self._notify(f"Error: {exc}", severity="error")
         self._refresh()

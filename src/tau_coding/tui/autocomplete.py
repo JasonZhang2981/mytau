@@ -117,16 +117,25 @@ def _command_completions(
 def _command_alias_completions(
     command: SlashCommand, *, prefix: str, token_end: int
 ) -> list[CompletionItem]:
-    names = (command.name,) if not prefix else (command.name, *command.aliases)
+    names = (
+        (command.name,)
+        if not prefix
+        else (command.name, *command.aliases, *command.search_terms)
+    )
     suggestions: list[CompletionItem] = []
+    seen: set[str] = set()
     for name in names:
         if not name.startswith(prefix):
             continue
-        display = f"/{name}"
-        replacement = f"/{name}"
-        if command.name == "skill" and name == command.name:
+        replacement_name = name if name in (command.name, *command.aliases) else command.name
+        display = f"/{replacement_name}"
+        replacement = f"/{replacement_name}"
+        if command.name == "skill" and replacement_name == command.name:
             display = "/skill:"
             replacement = "/skill:"
+        if display in seen:
+            continue
+        seen.add(display)
         suggestions.append(
             CompletionItem(
                 display=display,

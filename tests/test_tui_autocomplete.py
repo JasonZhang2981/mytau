@@ -33,6 +33,28 @@ def test_command_completion_suggests_registered_commands() -> None:
     assert state.selected.apply("/st") == "/status"
 
 
+def test_command_completion_matches_search_terms_with_canonical_replacement() -> None:
+    clear_state = build_completion_state(
+        "/cl",
+        command_registry=create_default_command_registry(),
+        skills=(),
+        prompt_templates=(),
+    )
+    sessions_state = build_completion_state(
+        "/sess",
+        command_registry=create_default_command_registry(),
+        skills=(),
+        prompt_templates=(),
+    )
+
+    assert [item.display for item in clear_state.items] == ["/new"]
+    assert clear_state.selected is not None
+    assert clear_state.selected.apply("/cl") == "/new"
+    assert [item.display for item in sessions_state.items] == ["/resume"]
+    assert sessions_state.selected is not None
+    assert sessions_state.selected.apply("/sess") == "/resume"
+
+
 def test_skill_command_completion_prefers_colon_form() -> None:
     state = build_completion_state(
         "/ski",

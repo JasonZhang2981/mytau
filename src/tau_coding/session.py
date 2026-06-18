@@ -1,7 +1,7 @@
 """Persistent coding-session wrapper built on AgentHarness."""
 
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from tau_agent import AgentEvent, AgentHarness, AgentHarnessConfig
@@ -380,6 +380,37 @@ class CodingSession:
         self._resource_paths = replacement._resource_paths
         self._auto_compact_token_threshold = replacement._auto_compact_token_threshold
         return f"Resumed session: {record.id}"
+
+    async def new_session(self) -> str:
+        """Replace this session's active state with a newly indexed session."""
+        manager = self._config.session_manager
+        if manager is None:
+            raise ValueError("Session manager is not available")
+
+        record = manager.create_session(cwd=self.cwd, model=self.model)
+        replacement = await type(self).load(
+            replace(
+                self._config,
+                model=record.model or self.model,
+                cwd=record.cwd,
+                storage=jsonl_session_storage(record.path),
+                session_id=record.id,
+            )
+        )
+        self._config = replacement._config
+        self._state = replacement._state
+        self._harness = replacement._harness
+        self._last_parent_id = replacement._last_parent_id
+        self._skills = replacement._skills
+        self._prompt_templates = replacement._prompt_templates
+        self._context_files = replacement._context_files
+        self._resource_diagnostics = replacement._resource_diagnostics
+        self._command_registry = replacement._command_registry
+        self._provider_name = replacement._provider_name
+        self._provider_settings = replacement._provider_settings
+        self._resource_paths = replacement._resource_paths
+        self._auto_compact_token_threshold = replacement._auto_compact_token_threshold
+        return f"Started new session: {record.id}"
 
     async def compact(self, summary: str) -> str:
         """Append a manual compaction summary and rebuild active context."""

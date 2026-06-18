@@ -73,6 +73,7 @@ class FakeSession:
         self.session_manager = None
         self.compact_summaries: list[str] = []
         self.resumed_session_ids: list[str] = []
+        self.new_session_count = 0
         self.prompt_texts: list[str] = []
         self.reload_count = 0
 
@@ -82,8 +83,8 @@ class FakeSession:
                 handled=True,
                 message="Available commands:\n/help\tShow available slash commands.",
             )
-        if text == "/clear":
-            return CommandResult(handled=True, clear_requested=True, message="Transcript cleared.")
+        if text == "/new":
+            return CommandResult(handled=True, new_session_requested=True)
         if text.startswith("/compact "):
             return CommandResult(handled=True, compact_summary=text.removeprefix("/compact "))
         if text.startswith("/resume "):
@@ -115,6 +116,11 @@ class FakeSession:
         self.resumed_session_ids.append(session_id)
         self.messages = (UserMessage(content="Restored prompt"),)
         return f"Resumed session: {session_id}"
+
+    async def new_session(self) -> str:
+        self.new_session_count += 1
+        self.messages = ()
+        return "Started new session: new-session"
 
     async def prompt(self, text: str) -> AsyncIterator[AgentEvent]:
         self.prompt_texts.append(text)
@@ -448,14 +454,15 @@ def test_tui_app_loads_restored_messages_into_display_state() -> None:
 
 
 @pytest.mark.anyio
-async def test_tui_app_clear_command_clears_visible_state() -> None:
+async def test_tui_app_new_command_starts_new_visible_state() -> None:
     app = TauTuiApp(FakeSession(messages=[UserMessage(content="Earlier")]))
 
     async with app.run_test() as pilot:
         prompt = app.query_one("#prompt")
-        prompt.value = "/clear"
+        prompt.value = "/new"
         await pilot.press("enter")
 
+        assert app.session.new_session_count == 1
         assert app.state.items == []
 
 

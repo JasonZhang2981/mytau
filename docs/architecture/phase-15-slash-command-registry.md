@@ -37,16 +37,19 @@ The default registry includes:
 
 - `/help` — list registered commands
 - `/exit` — request TUI exit
-- `/clear` — clear the visible transcript only
+- `/new` — start a new session
 - `/status` — show model, cwd, tools, skills, prompt templates, and session id
 - `/skills` — list loaded skills
 - `/skill` — explain `/skill:<name>` usage
-- `/sessions` — list indexed sessions when a session manager is available
-- `/resume` — request an indexed session resume
+- `/resume` — list or resume previous sessions
 - `/model` — choose or switch the current model
 - `/login` — add or refresh a built-in provider login
 
 Aliases include `/q`, `/quit`, and `/?`.
+
+Autocomplete also uses non-executable search terms. For example, typing
+`/clear` suggests `/new`, and typing `/sessions` suggests `/resume`, but those
+search terms are not registered commands.
 
 ## Why this belongs in `tau_coding`
 
@@ -66,8 +69,9 @@ session.handle_command(text)
 
 but the returned `CommandResult` can now request more than exit behavior.
 
-For example, `/clear` returns `clear_requested=True`. The TUI responds by clearing
-only its visible display state. It does not delete durable JSONL session history.
+For example, `/new` returns `new_session_requested=True`. The TUI responds by
+creating and loading a fresh indexed session without deleting older durable JSONL
+session history.
 
 ## Skill command behavior
 
@@ -102,9 +106,9 @@ The tests verify:
 
 - command parsing and dispatch
 - generated help output
-- exit and clear control flags
+- exit and new-session control flags
 - status and skills output
 - `/skill:<name>` passthrough behavior
 - indexed session listing
 - structured `/resume <session-id>` requests
-- TUI handling for `/clear`
+- TUI handling for `/new`

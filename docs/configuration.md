@@ -158,7 +158,7 @@ tau --new-session
 Inside the TUI:
 
 ```text
-/sessions
+/resume
 /status
 ```
 
