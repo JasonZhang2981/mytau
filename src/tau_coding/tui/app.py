@@ -1,5 +1,6 @@
 """Minimal Textual app for Tau coding sessions."""
 
+import asyncio
 from collections.abc import AsyncIterator, Sequence
 from inspect import isawaitable
 from pathlib import Path
@@ -18,7 +19,8 @@ from tau_agent.tools import AgentTool
 from tau_ai import ProviderErrorEvent, ProviderEvent
 from tau_ai.provider import CancellationToken
 from tau_coding.commands import CommandRegistry, create_default_command_registry
-from tau_coding.credentials import FileCredentialStore
+from tau_coding.credentials import FileCredentialStore, OAuthCredential
+from tau_coding.oauth import OAuthAuthInfo, OAuthPrompt, login_openai_codex
 from tau_coding.provider_catalog import (
     BUILTIN_PROVIDER_CATALOG,
     ProviderCatalogEntry,
@@ -406,9 +408,7 @@ class ModelPickerScreen(ModalScreen[ModelChoice | None]):
         )
         self._reset_model_list_index()
         help_text = (
-            "No matching models"
-            if not self.visible_choices
-            else "Enter selects - Escape closes"
+            "No matching models" if not self.visible_choices else "Enter selects - Escape closes"
         )
         self.query_one("#model-picker-help", Static).update(help_text)
 
@@ -500,6 +500,87 @@ class LoginScreen(ModalScreen[str | None]):
 
     def action_cancel(self) -> None:
         """Close without saving."""
+        self.dismiss(None)
+
+
+class OAuthLoginScreen(ModalScreen[OAuthCredential | None]):
+    """OAuth login flow for providers backed by subscription auth."""
+
+    BINDINGS: ClassVar[list[BindingEntry]] = [
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(self, provider: ProviderCatalogEntry, *, theme: TuiTheme) -> None:
+        super().__init__()
+        self.provider = provider
+        self.theme = theme
+        self._manual_code_future: asyncio.Future[str] | None = None
+        self._manual_code_value: str | None = None
+
+    def compose(self) -> ComposeResult:
+        """Compose the OAuth login prompt."""
+        with Vertical(id="login-screen"):
+            yield Static(f"Login: {self.provider.display_name}", id="login-title")
+            yield Static("Complete the browser login, or paste the redirect URL.", id="login-help")
+            yield Static("", id="login-oauth-url")
+            yield Input(
+                placeholder="Paste redirect URL or authorization code",
+                id="login-oauth-code",
+            )
+            yield Static("Enter submits - Escape closes", id="login-footer")
+
+    def on_mount(self) -> None:
+        """Focus the manual-code field and start OAuth."""
+        self.query_one("#login-oauth-code", Input).focus()
+        self.run_worker(self._run_login(), exclusive=True)
+
+    async def _run_login(self) -> None:
+        try:
+            credential = await login_openai_codex(
+                on_auth=self._show_auth,
+                on_prompt=self._prompt_for_code,
+                on_manual_code_input=self._manual_code_input,
+            )
+        except Exception as exc:  # noqa: BLE001 - surface OAuth failures in the TUI
+            self.query_one("#login-help", Static).update(f"OAuth failed: {exc}")
+            return
+        self.dismiss(credential)
+
+    def _show_auth(self, info: OAuthAuthInfo) -> None:
+        self.query_one("#login-oauth-url", Static).update(info.url)
+        if info.instructions:
+            self.query_one("#login-help", Static).update(info.instructions)
+
+    async def _prompt_for_code(self, prompt: OAuthPrompt) -> str:
+        self.query_one("#login-help", Static).update(prompt.message)
+        return await self._manual_code_input()
+
+    async def _manual_code_input(self) -> str:
+        if self._manual_code_value is not None:
+            return self._manual_code_value
+        loop = asyncio.get_running_loop()
+        self._manual_code_future = loop.create_future()
+        try:
+            return await self._manual_code_future
+        finally:
+            self._manual_code_future = None
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Resolve the manual OAuth code fallback."""
+        if event.input.id != "login-oauth-code":
+            return
+        event.stop()
+        value = event.value.strip()
+        if not value:
+            return
+        self._manual_code_value = value
+        if self._manual_code_future is not None and not self._manual_code_future.done():
+            self._manual_code_future.set_result(value)
+
+    def action_cancel(self) -> None:
+        """Close without saving OAuth credentials."""
+        if self._manual_code_future is not None and not self._manual_code_future.done():
+            self._manual_code_future.cancel()
         self.dismiss(None)
 
 
@@ -710,7 +791,8 @@ class TauTuiApp(App[None]):
         color: $tau-muted-text;
     }
 
-    LoginScreen {
+    LoginScreen,
+    OAuthLoginScreen {
         align: center middle;
     }
 
@@ -736,10 +818,18 @@ class TauTuiApp(App[None]):
         margin-bottom: 1;
     }
 
-    #login-api-key {
+    #login-api-key,
+    #login-oauth-code {
         background: $tau-prompt-background;
         color: $tau-prompt-text;
         border: tall $tau-prompt-border;
+        margin-bottom: 1;
+    }
+
+    #login-oauth-url {
+        min-height: 1;
+        max-height: 4;
+        color: $tau-chrome-text;
         margin-bottom: 1;
     }
 
@@ -1032,6 +1122,12 @@ class TauTuiApp(App[None]):
         if entry is None:
             self._notify(f"Unknown provider: {provider_name}", severity="error")
             return
+        if entry.kind == "openai-codex":
+            self.push_screen(
+                OAuthLoginScreen(entry, theme=self.tui_settings.resolved_theme),
+                callback=lambda credential: self._handle_oauth_login_result(entry, credential),
+            )
+            return
         self.push_screen(
             LoginScreen(entry, theme=self.tui_settings.resolved_theme),
             callback=lambda api_key: self._handle_login_result(entry, api_key),
@@ -1042,6 +1138,26 @@ class TauTuiApp(App[None]):
             return
         try:
             FileCredentialStore().set(entry.credential_name, api_key)
+            settings = load_provider_settings()
+            provider = provider_config_from_catalog_entry(entry.name)
+            save_provider_settings(upsert_provider(settings, provider, set_default=True))
+            self.session.reload()
+            self.session.set_provider(entry.name)
+        except Exception as exc:  # noqa: BLE001 - surface login failures in the TUI
+            self._notify(f"Could not save login: {exc}", severity="error")
+            return
+        self._notify(f"Saved login for {entry.display_name}.")
+        self._refresh()
+
+    def _handle_oauth_login_result(
+        self,
+        entry: ProviderCatalogEntry,
+        credential: OAuthCredential | None,
+    ) -> None:
+        if credential is None:
+            return
+        try:
+            FileCredentialStore().set_oauth(entry.credential_name, credential)
             settings = load_provider_settings()
             provider = provider_config_from_catalog_entry(entry.name)
             save_provider_settings(upsert_provider(settings, provider, set_default=True))
@@ -1212,18 +1328,16 @@ def _login_provider_label(provider: ProviderCatalogEntry) -> str:
     return f"{provider.display_name}\n  {provider.name}"
 
 
-def _model_picker_label(
-    choice: ModelChoice, *, current_model: str, current_provider: str
-) -> str:
-    marker = "* " if (
-        choice.provider_name == current_provider and choice.model == current_model
-    ) else "  "
+def _model_picker_label(choice: ModelChoice, *, current_model: str, current_provider: str) -> str:
+    marker = (
+        "* "
+        if (choice.provider_name == current_provider and choice.model == current_model)
+        else "  "
+    )
     return f"{marker}{choice.provider_name}:{choice.model}"
 
 
-def _filter_model_choices(
-    choices: Sequence[ModelChoice], query: str
-) -> tuple[ModelChoice, ...]:
+def _filter_model_choices(choices: Sequence[ModelChoice], query: str) -> tuple[ModelChoice, ...]:
     normalized = query.strip().lower()
     if not normalized:
         return tuple(choices)

@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from tau_agent import (
     UserMessage,
 )
 from tau_coding.commands import CommandResult
+from tau_coding.credentials import OAuthCredential
 from tau_coding.provider_config import OpenAICompatibleProviderConfig, ProviderSettings
 from tau_coding.session import ModelChoice
 from tau_coding.session_manager import CodingSessionRecord
@@ -33,6 +35,7 @@ from tau_coding.tui.app import (
     LoginProviderPickerScreen,
     LoginScreen,
     ModelPickerScreen,
+    OAuthLoginScreen,
     SessionPickerScreen,
     TauTuiApp,
 )
@@ -98,8 +101,8 @@ class FakeSession:
             return CommandResult(handled=True, resume_picker_requested=True)
         if text == "/login":
             return CommandResult(handled=True, login_picker_requested=True)
-        if text == "/login openai":
-            return CommandResult(handled=True, login_provider="openai")
+        if text.startswith("/login "):
+            return CommandResult(handled=True, login_provider=text.removeprefix("/login "))
         if text == "/model":
             return CommandResult(handled=True, model_picker_requested=True)
         if text.startswith("/thinking "):
@@ -804,9 +807,7 @@ async def test_tui_app_quits_from_focused_prompt_with_default_keybinding() -> No
     async with app.run_test() as pilot:
         prompt = app.query_one("#prompt")
         visible_bindings = [
-            binding
-            for binding in prompt._bindings.get_bindings_for_key("ctrl+d")
-            if binding.show
+            binding for binding in prompt._bindings.get_bindings_for_key("ctrl+d") if binding.show
         ]
 
         assert any(
@@ -870,6 +871,46 @@ async def test_tui_login_saves_provider_key(
 
 
 @pytest.mark.anyio
+async def test_tui_login_openai_codex_saves_oauth_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    credential_future = asyncio.get_running_loop().create_future()
+
+    async def fake_login_openai_codex(**_kwargs: object) -> OAuthCredential:
+        return await credential_future
+
+    monkeypatch.setattr(tui_app, "login_openai_codex", fake_login_openai_codex)
+    session = FakeSession()
+    app = TauTuiApp(session)
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.value = "/login openai-codex"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert isinstance(app.screen, OAuthLoginScreen)
+        credential_future.set_result(
+            OAuthCredential(
+                access="access-token",
+                refresh="refresh-token",
+                expires=123456,
+                account_id="account-1",
+            )
+        )
+        await pilot.pause()
+
+    assert session.reload_count == 1
+    assert session.provider_name == "openai-codex"
+    assert all("access-token" not in item.text for item in app.state.items)
+    credentials = (tmp_path / ".tau" / "credentials.json").read_text(encoding="utf-8")
+    assert '"type": "oauth"' in credentials
+    assert "refresh-token" in credentials
+
+
+@pytest.mark.anyio
 async def test_tui_login_opens_provider_picker() -> None:
     app = TauTuiApp(FakeSession())
 
@@ -883,8 +924,10 @@ async def test_tui_login_opens_provider_picker() -> None:
         provider_list = app.screen.query_one("#login-provider-list", ListView)
         labels = [str(item.query_one(Label).render()) for item in provider_list.children]
         assert labels[0] == "OpenAI\n  openai"
+        assert labels[1] == "OpenAI Codex subscription\n  openai-codex"
         assert "gpt-5.5" not in "\n".join(labels)
 
+        await pilot.press("down")
         await pilot.press("down")
         await pilot.press("enter")
         await pilot.pause()
