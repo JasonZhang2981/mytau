@@ -168,7 +168,8 @@ def test_session_sidebar_renders_session_metadata() -> None:
     assert "████████" in output
     assert "τ = 2π" in output
     assert "session" in output
-    assert "context" not in output
+    assert "context" in output
+    assert "AGENTS.md" in output
     assert "12k" not in output
     assert "provider" in output
     assert "openai" in output
@@ -187,9 +188,29 @@ def test_session_sidebar_uses_square_muted_panels() -> None:
     sidebar = render_session_sidebar(FakeSession())
     panels = [renderable for renderable in sidebar.renderables if isinstance(renderable, Panel)]
 
-    assert len(panels) == 4
+    assert len(panels) == 5
     assert all(renderable.box == box.SQUARE for renderable in panels)
     assert {str(renderable.border_style) for renderable in panels} == {"#141922"}
+
+
+def test_session_sidebar_lists_multiple_context_files() -> None:
+    session = FakeSession()
+    session.context_files = (
+        ProjectContextFile(path=str(session.cwd / "AGENTS.md"), content="Root rules."),
+        ProjectContextFile(
+            path=str(session.cwd / ".agents" / "AGENTS.md"),
+            content="Agent rules.",
+        ),
+        ProjectContextFile(path="docs/AGENTS.md", content="Docs rules."),
+    )
+    console = Console(record=True, width=100)
+
+    console.print(render_session_sidebar(session))
+
+    output = console.export_text()
+    assert "AGENTS.md" in output
+    assert ".agents/AGENTS.md" in output
+    assert "docs/AGENTS.md" in output
 
 
 def test_compact_session_info_renders_sidebar_facts() -> None:

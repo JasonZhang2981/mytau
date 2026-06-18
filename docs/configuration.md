@@ -138,6 +138,8 @@ The built-in themes are:
 
 The built-in sidebar is responsive: Tau shows it on medium or larger terminal
 windows and hides it automatically when the terminal is narrow or short.
+When visible, it includes the active provider/model, thinking mode, loaded tools,
+skills, prompt templates, and context files such as `AGENTS.md`.
 
 Any omitted keybinding uses the built-in default. Key names use Textual's key
 syntax, such as `ctrl+k`, `tab`, `shift+tab`, `down`, `up`, and `f2`. Tau rejects unknown
