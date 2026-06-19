@@ -109,11 +109,12 @@ instead of in the top status line. This keeps the bottom input area visually
 active while an agent turn is running, and leaves the top status area focused on
 provider, model, queue, and session state.
 
-The footer now includes a compact shortcut hint row. It describes the active
-submission, newline, picker, thinking, follow-up, and copy shortcuts, switches
-to autocomplete-focused hints while completions are open, and switches again
-while an agent turn is running. The row is hidden on short terminals so it does
-not steal space from the transcript.
+The Textual footer now carries Tau's shortcut hints through ordinary visible
+bindings. It describes the active submission, newline, picker, thinking,
+follow-up, and copy shortcuts, switches to autocomplete-focused bindings while
+completions are open, and switches again while an agent turn is running. Tau
+does not add a separate custom hint row; the built-in bottom toolbar remains the
+single shortcut surface.
 
 Transcript copying now prefers visible terminal selection. If the user selects
 visible transcript text and presses the copy shortcut, Tau copies that selected
@@ -159,10 +160,13 @@ uv run tau
 2. Check the working indicator by submitting a prompt that takes a few seconds.
    The spinner or activity text should appear in the row directly above the
    prompt while the turn runs, not in the top status line.
-3. Check shortcut hints in a normal-size terminal. The hint row should appear
-   above the footer, change when slash-command autocomplete is open, and change
-   again while an agent turn is running. Shrink the terminal height and confirm
-   the row hides to preserve transcript space.
+3. Check shortcut hints in the built-in bottom footer. It should show prompt
+   actions such as submit, newline, commands, sessions, thinking, copy, and
+   quit. Open slash-command autocomplete and confirm the same footer switches to
+   complete, choose, and close actions. Submit a prompt that takes a few seconds
+   and confirm the footer switches to steer, follow-up, cancel, thinking, tools,
+   and copy actions. There should not be a second custom shortcut row above the
+   footer.
 4. Check visible selection copy by selecting part of a transcript message with
    the terminal mouse selection and pressing `Ctrl+C`. Paste into another buffer
    and confirm only the selected visible text was copied. Then clear the

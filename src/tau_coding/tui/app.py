@@ -9,6 +9,7 @@ from typing import Any, ClassVar, Literal, Protocol, cast
 
 from rich.console import Group
 from rich.text import Text
+from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingsMap
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -72,7 +73,6 @@ from tau_coding.tui.widgets import (
 type BindingEntry = Binding | tuple[str, str] | tuple[str, str, str]
 SIDEBAR_MIN_WIDTH = 96
 SIDEBAR_MIN_HEIGHT = 24
-ACTIVITY_TRAIL_PERIOD = 80
 ACTIVITY_TICK_SECONDS = 0.4
 ACTIVITY_FRAMES = ("|", "/", "-", "\\")
 
@@ -159,8 +159,24 @@ class PromptInput(TextArea):
     ) -> None:
         super().__init__(**kwargs)
         self.tui_keybindings = tui_keybindings or TuiKeybindings()
+        self._base_bindings = self._bindings.copy()
+        self._footer_mode: Literal["normal", "completion", "running"] = "normal"
+        self._apply_prompt_bindings()
+
+    def set_footer_mode(self, mode: Literal["normal", "completion", "running"]) -> None:
+        """Switch the prompt bindings shown by Textual's built-in footer."""
+        if mode == self._footer_mode:
+            return
+        self._footer_mode = mode
+        self._apply_prompt_bindings()
+        self.refresh_bindings()
+
+    def _apply_prompt_bindings(self) -> None:
         self._bindings = BindingsMap.merge(
-            [self._bindings, BindingsMap(_prompt_bindings(self.tui_keybindings))]
+            [
+                self._base_bindings,
+                BindingsMap(_prompt_bindings(self.tui_keybindings, mode=self._footer_mode)),
+            ]
         )
 
     @property
@@ -204,6 +220,10 @@ class PromptInput(TextArea):
         else:
             self.action_cursor_up()
 
+    def action_cancel(self) -> None:
+        """Run the app-level cancel action."""
+        self._completion_target().action_cancel()
+
     def action_open_command_palette(self) -> None:
         """Open the app-level command palette."""
         self._completion_target().action_open_command_palette()
@@ -234,7 +254,7 @@ class PromptInput(TextArea):
 
     def action_copy_selected_message(self) -> None:
         """Clear the current prompt before falling back to message copy."""
-        if self.selected_text:
+        if self.selected_text or self.app.screen.get_selected_text():
             return
         if self.text:
             self.text = ""
@@ -245,6 +265,14 @@ class PromptInput(TextArea):
     async def action_submit_follow_up(self) -> None:
         """Submit the prompt as an app-level follow-up."""
         await self._completion_target().action_submit_follow_up()
+
+    async def action_submit_prompt(self) -> None:
+        """Submit the prompt through the app-level action."""
+        await self._completion_target().action_submit_prompt()
+
+    def action_insert_newline(self) -> None:
+        """Insert a newline in the prompt."""
+        self.insert("\n")
 
     async def action_quit(self) -> None:
         """Quit the app through the app-level action."""
@@ -301,7 +329,7 @@ class PromptInput(TextArea):
             event.stop()
             self._completion_target().action_select_next_message()
         elif event.key == keybindings.copy_message:
-            if self.selected_text:
+            if self.selected_text or self.app.screen.get_selected_text():
                 return
             event.stop()
             event.prevent_default()
@@ -825,17 +853,6 @@ class TauTuiApp(App[None]):
         color: $tau-muted-text;
     }
 
-    #shortcut-hints {
-        height: 1;
-        padding: 0 1;
-        background: $tau-chrome-background;
-        color: $tau-muted-text;
-    }
-
-    TauTuiApp.-compact-footer #shortcut-hints {
-        display: none;
-    }
-
     #status {
         height: 1;
         padding: 0 1;
@@ -897,13 +914,6 @@ class TauTuiApp(App[None]):
 
     #prompt:focus {
         border: tall $tau-prompt-border;
-    }
-
-    #activity-trail {
-        height: 1;
-        margin: 0 1 0 1;
-        padding: 0 1;
-        background: $tau-screen-background;
     }
 
     #activity-status {
@@ -1174,10 +1184,8 @@ class TauTuiApp(App[None]):
                     id="prompt",
                     tui_keybindings=self.tui_settings.keybindings,
                 )
-                yield Static("", id="activity-trail")
                 yield CompactSessionInfo(id="compact-session-info")
                 yield Static("", id="autocomplete")
-        yield Static("", id="shortcut-hints")
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -1190,6 +1198,19 @@ class TauTuiApp(App[None]):
             self._notify(self.startup_message, severity="warning")
         if self.initial_prompt and self.initial_prompt.strip():
             self._submit_prompt(self.initial_prompt.strip())
+
+    @on(events.TextSelected)
+    async def on_text_selected(self) -> None:
+        """Automatically copy visible transcript selections."""
+        selected_text = self._visible_selection_text()
+        if selected_text is None:
+            return
+        try:
+            self.copy_to_clipboard(selected_text)
+        except Exception as exc:  # noqa: BLE001 - terminal clipboard support varies
+            self._notify(f"Could not copy selection: {exc}", severity="error")
+            return
+        self._notify("Copied selected text.")
 
     def on_unmount(self) -> None:
         """Stop the activity timer when the app is torn down."""
@@ -1448,16 +1469,6 @@ class TauTuiApp(App[None]):
 
     def action_copy_selected_message(self) -> None:
         """Copy the selected transcript message to the terminal clipboard."""
-        selected_text = self._visible_selection_text()
-        if selected_text is not None:
-            try:
-                self.copy_to_clipboard(selected_text)
-            except Exception as exc:  # noqa: BLE001 - terminal clipboard support varies
-                self._notify(f"Could not copy selection: {exc}", severity="error")
-                return
-            self._notify("Copied selected text.")
-            return
-
         text = self._selected_message_text()
         if text is None:
             self._notify("Select a transcript message first.", severity="warning")
@@ -1707,7 +1718,7 @@ class TauTuiApp(App[None]):
         self._sync_activity_indicator()
         status = self.query_one("#status", Static)
         status.update(self._status_text())
-        self._refresh_shortcut_hints()
+        self._refresh_footer_bindings()
 
     def _sync_queue_state(self) -> None:
         queue_event = getattr(self.session, "queue_update_event", None)
@@ -1735,7 +1746,7 @@ class TauTuiApp(App[None]):
     def _tick_activity(self) -> None:
         if not self.state.running:
             return
-        self._activity_frame = (self._activity_frame + 1) % ACTIVITY_TRAIL_PERIOD
+        self._activity_frame = (self._activity_frame + 1) % len(ACTIVITY_FRAMES)
         self._apply_activity_indicator()
         status = self.query_one("#status", Static)
         status.update(self._status_text())
@@ -1743,12 +1754,15 @@ class TauTuiApp(App[None]):
     def _apply_activity_indicator(self) -> None:
         activity = self.query_one("#activity-status", Static)
         activity.update(self._activity_text())
-        trail = self.query_one("#activity-trail", Static)
-        trail.display = self.state.running
-        if not self.state.running:
-            trail.update("")
-            return
-        trail.update(_render_activity_trail(trail.size.width, self._activity_frame))
+        prompt = self.query_one("#prompt", PromptInput)
+        prompt.styles.border = (
+            "tall",
+            _activity_prompt_border_color(
+                self.tui_settings.resolved_theme,
+                frame=self._activity_frame,
+                running=self.state.running,
+            ),
+        )
 
     def _activity_text(self) -> str:
         if not self.state.running:
@@ -1770,12 +1784,11 @@ class TauTuiApp(App[None]):
                 theme=self.tui_settings.resolved_theme,
             )
         )
-        self._refresh_shortcut_hints()
+        self._refresh_footer_bindings()
 
     def _update_responsive_layout(self, width: int, height: int) -> None:
         show_sidebar = width >= SIDEBAR_MIN_WIDTH and height >= SIDEBAR_MIN_HEIGHT
         self.set_class(not show_sidebar, "-hide-sidebar")
-        self.set_class(height < 22, "-compact-footer")
 
     def _build_completion_state(self, text: str) -> CompletionState:
         registry = _session_command_registry(self.session)
@@ -1790,42 +1803,22 @@ class TauTuiApp(App[None]):
             session_options=_session_options(self.session),
         )
 
-    def _refresh_shortcut_hints(self) -> None:
-        hints = self.query_one("#shortcut-hints", Static)
-        hints.update(
-            _shortcut_hint_text(
-                self.tui_settings.keybindings,
-                self.state,
-                self._completion_state,
-            )
-        )
+    def _refresh_footer_bindings(self) -> None:
+        prompt = self.query_one("#prompt", PromptInput)
+        prompt.set_footer_mode(_prompt_footer_mode(self.state, self._completion_state))
 
 
-def _render_activity_trail(width: int, frame: int) -> Text:
-    """Render a subtle bouncing activity pixel below the prompt."""
-    usable_width = max(2, width)
-    if usable_width == 1:
-        return Text("•", style="#64748b", overflow="crop", no_wrap=True)
-
-    cycle = (usable_width - 1) * 2
-    offset = frame % cycle
-    moving_right = offset < usable_width
-    position = offset if moving_right else cycle - offset
-    tail_positions = (
-        range(max(0, position - 3), position)
-        if moving_right
-        else range(position + 1, min(usable_width, position + 4))
+def _activity_prompt_border_color(theme: TuiTheme, *, frame: int, running: bool) -> str:
+    """Return the prompt border color for the current activity animation frame."""
+    if not running:
+        return theme.prompt_border
+    palette = (
+        theme.prompt_border,
+        theme.accent,
+        theme.highlight_background,
+        theme.accent,
     )
-
-    chars = [" "] * usable_width
-    for index, tail_position in enumerate(tail_positions):
-        chars[tail_position] = "·" if index < 2 else "∙"
-    chars[position] = "•"
-    trail = Text("".join(chars), style="#334155", overflow="crop", no_wrap=True)
-    for tail_position in tail_positions:
-        trail.stylize("#475569", tail_position, tail_position + 1)
-    trail.stylize("#94a3b8", position, position + 1)
-    return trail
+    return palette[frame % len(palette)]
 
 
 def _session_command_registry(session: CodingSession) -> CommandRegistry:
@@ -1983,46 +1976,15 @@ def _render_queued_messages(state: TuiState, *, theme: TuiTheme) -> Group:
     return Group(*rows)
 
 
-def _shortcut_hint_text(
-    keybindings: TuiKeybindings,
+def _prompt_footer_mode(
     state: TuiState,
     completion_state: CompletionState,
-) -> str:
+) -> Literal["normal", "completion", "running"]:
     if completion_state.items:
-        return _join_shortcut_hints(
-            (
-                f"{_key_hint(keybindings.accept_completion)}/Enter complete",
-                f"{_key_hint(keybindings.completion_previous)}/"
-                f"{_key_hint(keybindings.completion_next)} choose",
-                f"{_key_hint(keybindings.cancel)} close",
-            )
-        )
+        return "completion"
     if state.running:
-        return _join_shortcut_hints(
-            (
-                "Enter steer",
-                f"{_key_hint(keybindings.queue_follow_up)} follow-up",
-                f"{_key_hint(keybindings.cancel)} cancel",
-                f"{_key_hint(keybindings.toggle_thinking)} thinking",
-                f"{_key_hint(keybindings.toggle_tool_results)} tools",
-                f"{_key_hint(keybindings.copy_message)} copy",
-            )
-        )
-    return _join_shortcut_hints(
-        (
-            "Enter submit",
-            "Shift+Enter newline",
-            f"{_key_hint(keybindings.command_palette)} commands",
-            f"{_key_hint(keybindings.session_picker)} sessions",
-            f"{_key_hint(keybindings.thinking_cycle)} thinking",
-            f"{_key_hint(keybindings.copy_message)} copy",
-            f"{_key_hint(keybindings.quit)} quit",
-        )
-    )
-
-
-def _join_shortcut_hints(parts: Sequence[str]) -> str:
-    return " | ".join(parts)
+        return "running"
+    return "normal"
 
 
 def _key_hint(key: str) -> str:
@@ -2068,46 +2030,100 @@ def _app_bindings(keybindings: TuiKeybindings) -> list[Binding]:
     ]
 
 
-def _prompt_bindings(keybindings: TuiKeybindings) -> list[Binding]:
-    return [
-        Binding(keybindings.command_palette, "open_command_palette", show=False, priority=True),
-        Binding(keybindings.session_picker, "open_session_picker", show=False, priority=True),
-        Binding(keybindings.queue_follow_up, "submit_follow_up", show=False, priority=True),
-        Binding(keybindings.thinking_cycle, "cycle_thinking", show=False, priority=True),
-        Binding(
-            keybindings.toggle_tool_results,
-            "toggle_tool_results",
-            show=False,
-            priority=True,
-        ),
-        Binding(
-            keybindings.toggle_thinking,
-            "toggle_thinking",
-            show=False,
-            priority=True,
-        ),
-        Binding(
-            keybindings.message_previous,
-            "select_previous_message",
-            show=False,
-            priority=True,
-        ),
-        Binding(
-            keybindings.message_next,
-            "select_next_message",
-            show=False,
-            priority=True,
-        ),
+def _prompt_bindings(
+    keybindings: TuiKeybindings,
+    *,
+    mode: Literal["normal", "completion", "running"],
+) -> list[Binding]:
+    if mode == "completion":
+        bindings = [
+            Binding(
+                keybindings.accept_completion,
+                "accept_completion",
+                "Complete",
+                key_display=f"{_key_hint(keybindings.accept_completion)}/Enter",
+                priority=True,
+            ),
+            Binding(
+                keybindings.completion_next,
+                "completion_next",
+                "Choose",
+                key_display=(
+                    f"{_key_hint(keybindings.completion_previous)}/"
+                    f"{_key_hint(keybindings.completion_next)}"
+                ),
+                priority=True,
+            ),
+            Binding(keybindings.cancel, "cancel", "Close", priority=True),
+        ]
+        return bindings + _hidden_prompt_bindings(keybindings, visible_bindings=bindings)
+    if mode == "running":
+        bindings = [
+            Binding("enter", "submit_prompt", "Steer", priority=True),
+            Binding(keybindings.queue_follow_up, "submit_follow_up", "Follow-up", priority=True),
+            Binding(keybindings.cancel, "cancel", "Cancel", priority=True),
+            Binding(
+                keybindings.toggle_thinking,
+                "toggle_thinking",
+                "Thinking",
+                priority=True,
+            ),
+            Binding(
+                keybindings.toggle_tool_results,
+                "toggle_tool_results",
+                "Tools",
+                priority=True,
+            ),
+            Binding(
+                keybindings.copy_message,
+                "copy_selected_message",
+                "Copy",
+                priority=True,
+            ),
+        ]
+        return bindings + _hidden_prompt_bindings(keybindings, visible_bindings=bindings)
+    bindings = [
+        Binding("enter", "submit_prompt", "Submit", priority=True),
+        Binding("shift+enter", "insert_newline", "Newline", priority=True),
+        Binding(keybindings.command_palette, "open_command_palette", "Commands", priority=True),
+        Binding(keybindings.session_picker, "open_session_picker", "Sessions", priority=True),
+        Binding(keybindings.thinking_cycle, "cycle_thinking", "Thinking", priority=True),
         Binding(
             keybindings.copy_message,
             "copy_selected_message",
-            show=False,
+            "Copy",
             priority=True,
         ),
-        Binding(keybindings.accept_completion, "accept_completion", show=False, priority=True),
-        Binding(keybindings.completion_next, "completion_next", show=False, priority=True),
-        Binding(keybindings.completion_previous, "completion_previous", show=False, priority=True),
         Binding(keybindings.quit, "quit", "Quit", priority=True),
+    ]
+    return bindings + _hidden_prompt_bindings(keybindings, visible_bindings=bindings)
+
+
+def _hidden_prompt_bindings(
+    keybindings: TuiKeybindings,
+    *,
+    visible_bindings: Sequence[Binding],
+) -> list[Binding]:
+    visible_keys = {key for binding in visible_bindings for key in binding.key.split(",")}
+    candidates = (
+        (keybindings.command_palette, "open_command_palette"),
+        (keybindings.session_picker, "open_session_picker"),
+        (keybindings.queue_follow_up, "submit_follow_up"),
+        (keybindings.thinking_cycle, "cycle_thinking"),
+        (keybindings.toggle_tool_results, "toggle_tool_results"),
+        (keybindings.toggle_thinking, "toggle_thinking"),
+        (keybindings.message_previous, "select_previous_message"),
+        (keybindings.message_next, "select_next_message"),
+        (keybindings.copy_message, "copy_selected_message"),
+        (keybindings.accept_completion, "accept_completion"),
+        (keybindings.completion_next, "completion_next"),
+        (keybindings.completion_previous, "completion_previous"),
+        (keybindings.quit, "quit"),
+    )
+    return [
+        Binding(key, action, show=False, priority=True)
+        for key, action in candidates
+        if key not in visible_keys
     ]
 
 

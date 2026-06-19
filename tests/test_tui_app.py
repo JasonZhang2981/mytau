@@ -6,8 +6,12 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 from rich.panel import Panel
+from rich.segment import Segment
 from textual.containers import VerticalScroll
-from textual.widgets import Button, Input, Label, ListView, TextArea
+from textual.geometry import Offset
+from textual.selection import Selection
+from textual.strip import Strip
+from textual.widgets import Button, Footer, Input, Label, ListView, TextArea
 
 from tau_agent import (
     AgentEndEvent,
@@ -187,6 +191,15 @@ class FakeSession:
             return
         for event in self.events:
             yield event
+
+
+def _visible_footer_bindings(app: TauTuiApp) -> dict[str, str]:
+    """Return visible bindings that Textual's built-in Footer will render."""
+    return {
+        binding.description: binding.key_display or binding.key
+        for _, binding, _enabled, _tooltip in app.screen.active_bindings.values()
+        if binding.show
+    }
 
 
 def test_session_sidebar_renders_session_metadata() -> None:
@@ -488,6 +501,7 @@ async def test_transcript_view_exposes_visible_text_selection() -> None:
 
         transcript = app.query_one("#transcript", TranscriptView)
         transcript.text_select_all()
+        await pilot.pause()
 
         selected = app.screen.get_selected_text()
         assert selected is not None
@@ -566,16 +580,22 @@ async def test_tui_app_mounts_sidebar_and_transcript() -> None:
 
 
 @pytest.mark.anyio
-async def test_tui_app_shows_footer_shortcut_hints() -> None:
+async def test_tui_app_uses_textual_footer_for_shortcut_hints() -> None:
     app = TauTuiApp(FakeSession())
 
     async with app.run_test(size=(120, 30)):
-        hints = app.query_one("#shortcut-hints")
-
-        assert str(hints.render()) == (
-            "Enter submit | Shift+Enter newline | Ctrl+K commands | Ctrl+R sessions | "
-            "Shift+Tab thinking | Ctrl+C copy | Ctrl+D quit"
-        )
+        assert app.query_one(Footer) is not None
+        assert len(app.query("#shortcut-hints")) == 0
+        assert _visible_footer_bindings(app) == {
+            "Quit": "ctrl+d",
+            "Copy": "ctrl+c",
+            "Commands": "ctrl+k",
+            "Submit": "enter",
+            "Newline": "shift+enter",
+            "Sessions": "ctrl+r",
+            "Thinking": "shift+tab",
+            "Cancel": "escape",
+        }
 
 
 @pytest.mark.anyio
@@ -588,8 +608,11 @@ async def test_tui_app_footer_hints_update_for_completions() -> None:
         app._completion_state = app._build_completion_state(prompt.value)
         app._refresh_completions()
 
-        hints = app.query_one("#shortcut-hints")
-        assert str(hints.render()) == "Tab/Enter complete | Up/Down choose | Escape close"
+        assert _visible_footer_bindings(app) == {
+            "Choose": "Up/Down",
+            "Complete": "Tab/Enter",
+            "Close": "escape",
+        }
 
 
 @pytest.mark.anyio
@@ -600,22 +623,23 @@ async def test_tui_app_footer_hints_update_while_running() -> None:
         app.adapter.apply(AgentStartEvent())
         app._refresh()
 
-        hints = app.query_one("#shortcut-hints")
-        assert str(hints.render()) == (
-            "Enter steer | Alt+Enter follow-up | Escape cancel | Ctrl+T thinking | "
-            "Ctrl+O tools | Ctrl+C copy"
-        )
+        assert _visible_footer_bindings(app) == {
+            "Copy": "ctrl+c",
+            "Steer": "enter",
+            "Follow-up": "alt+enter",
+            "Cancel": "escape",
+            "Thinking": "ctrl+t",
+            "Tools": "ctrl+o",
+        }
 
 
 @pytest.mark.anyio
-async def test_tui_app_hides_footer_hints_on_short_windows() -> None:
+async def test_tui_app_keeps_textual_footer_on_short_windows() -> None:
     app = TauTuiApp(FakeSession())
 
     async with app.run_test(size=(120, 18)):
-        hints = app.query_one("#shortcut-hints")
-
-        assert hints.display is False
-        assert app.has_class("-compact-footer")
+        assert app.query_one(Footer).display is True
+        assert len(app.query("#shortcut-hints")) == 0
 
 
 @pytest.mark.anyio
@@ -821,43 +845,38 @@ def test_tui_app_loads_restored_messages_into_display_state() -> None:
 
 
 @pytest.mark.anyio
-async def test_tui_app_shows_activity_indicators_while_running() -> None:
+async def test_tui_app_shows_activity_indicator_while_running() -> None:
     app = TauTuiApp(FakeSession())
 
     async with app.run_test():
-        trail = app.query_one("#activity-trail")
         status = app.query_one("#status")
         activity = app.query_one("#activity-status")
         prompt = app.query_one("#prompt")
 
         assert str(status.render()) == "Ready"
-        assert trail.display is False
         assert str(activity.render()) == ""
         assert activity.region.y < prompt.region.y
+        assert prompt.styles.border.top[1].hex.lower() == "#2d3748"
 
         app.adapter.apply(AgentStartEvent())
         app._refresh()
 
         assert str(status.render()) == ""
-        assert trail.display is True
-        assert "•" in str(trail.render())
         assert str(activity.render()) == "working |"
         assert tui_app.ACTIVITY_TICK_SECONDS == pytest.approx(0.4)
+        assert prompt.styles.border.top[1].hex.lower() == "#2d3748"
 
         app._tick_activity()
 
         assert str(activity.render()) == "working /"
-        assert str(tui_app._render_activity_trail(10, 0)) != str(
-            tui_app._render_activity_trail(10, 1)
-        )
+        assert prompt.styles.border.top[1].hex.lower() == "#f4a261"
 
         app.adapter.apply(AgentEndEvent())
         app._refresh()
 
         assert str(status.render()) == "Ready"
-        assert trail.display is False
-        assert str(trail.render()) == ""
         assert str(activity.render()) == ""
+        assert prompt.styles.border.top[1].hex.lower() == "#2d3748"
 
 
 @pytest.mark.anyio
@@ -1847,13 +1866,42 @@ async def test_tui_app_copies_visible_transcript_selection_first() -> None:
     async with app.run_test() as pilot:
         transcript = app.query_one("#transcript", TranscriptView)
         transcript.text_select_all()
-        await pilot.press("ctrl+c")
+        await app.on_text_selected()
         await pilot.pause()
 
     assert len(copied) == 1
     assert "User prompt" in copied[0]
     assert "Assistant response" in copied[0]
     assert "print('hi')" in copied[0]
+    assert notifications == ["Copied selected text."]
+
+
+@pytest.mark.anyio
+async def test_tui_app_copy_shortcut_ignores_visible_selection() -> None:
+    app = TauTuiApp(FakeSession(messages=(UserMessage(content="User prompt"),)))
+    copied: list[str] = []
+    notifications: list[str] = []
+
+    def fake_copy(text: str) -> None:
+        copied.append(text)
+
+    def fake_notify(message: str, **kwargs: object) -> None:
+        del kwargs
+        notifications.append(message)
+
+    app.copy_to_clipboard = fake_copy  # type: ignore[method-assign]
+    app._notify = fake_notify  # type: ignore[method-assign]
+
+    async with app.run_test() as pilot:
+        transcript = app.query_one("#transcript", TranscriptView)
+        transcript.text_select_all()
+        await app.on_text_selected()
+        await pilot.pause()
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+
+    assert len(copied) == 1
+    assert "User prompt" in copied[0]
     assert notifications == ["Copied selected text."]
 
 

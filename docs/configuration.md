@@ -151,11 +151,11 @@ windows and hides it automatically when the terminal is narrow or short.
 When visible, it includes the active provider/model, thinking mode, loaded tools,
 skills, prompt templates, and context files such as `AGENTS.md`.
 
-The TUI footer includes a compact shortcut hint row for prompt submission,
-newlines, command/session pickers, thinking controls, queued follow-ups, and
-copy actions. The hints switch when autocomplete is open or an agent turn is
-running, and the row is hidden on short terminals to preserve conversation
-space.
+The TUI uses Textual's built-in footer to show shortcut hints for prompt
+submission, newlines, command/session pickers, thinking controls, queued
+follow-ups, and copy actions. The visible footer bindings switch when
+autocomplete is open or an agent turn is running, so the bottom toolbar stays in
+Textual's standard footer instead of using a separate custom hint row.
 
 Transcript text supports Textual selection for visible user, assistant, tool, and
 error output. Copy shortcuts are terminal-emulator dependent, and selecting the
