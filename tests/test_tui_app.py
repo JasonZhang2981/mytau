@@ -985,10 +985,12 @@ async def test_tui_app_shows_activity_indicator_while_running() -> None:
 
     async with app.run_test():
         prompt = app.query_one("#prompt")
+        indicator = app.query_one("#activity-indicator")
 
         assert not app.query("#status")
         assert not app.query("#activity-status")
         assert prompt.styles.border.top[1].hex.lower() == "#2d3748"
+        assert indicator.render().plain == " \n \n "
 
         app.adapter.apply(AgentStartEvent())
         app._refresh()
@@ -996,16 +998,19 @@ async def test_tui_app_shows_activity_indicator_while_running() -> None:
         assert pytest.approx(tui_app.ACTIVITY_TICK_SECONDS) == 0.15
         assert tui_app.ACTIVITY_COLOR_FADE_STEPS == 24
         assert prompt.styles.border.top[1].hex.lower() == "#2d3748"
+        assert indicator.render().plain.startswith("■")
 
         app._tick_activity()
 
-        assert prompt.styles.border.top[1].hex.lower() == "#353b49"
+        assert prompt.styles.border.top[1].hex.lower() == "#2d3748"
+        assert indicator.render().plain.splitlines()[1] == "■"
 
         app.adapter.apply(AgentEndEvent())
         app._refresh()
 
         assert not app.query("#status")
         assert prompt.styles.border.top[1].hex.lower() == "#2d3748"
+        assert indicator.render().plain == " \n \n "
 
 
 @pytest.mark.anyio
@@ -1014,6 +1019,7 @@ async def test_tui_app_clears_activity_status_on_error() -> None:
 
     async with app.run_test():
         prompt = app.query_one("#prompt")
+        indicator = app.query_one("#activity-indicator")
         app.adapter.apply(AgentStartEvent())
         app._refresh()
         app.adapter.apply(ErrorEvent(message="provider failed", recoverable=False))
@@ -1022,6 +1028,7 @@ async def test_tui_app_clears_activity_status_on_error() -> None:
         assert not app.query("#status")
         assert not app.query("#activity-status")
         assert prompt.styles.border.top[1].hex.lower() == "#2d3748"
+        assert indicator.render().plain == " \n \n "
 
 
 @pytest.mark.anyio
