@@ -4,7 +4,6 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
-from rich import box
 from rich.console import Console
 from rich.panel import Panel
 from textual.containers import VerticalScroll
@@ -210,13 +209,19 @@ def test_session_sidebar_renders_session_metadata() -> None:
     assert "review" in output
 
 
-def test_session_sidebar_uses_square_muted_panels() -> None:
+def test_session_sidebar_uses_bold_muted_headers_without_section_borders() -> None:
+    console = Console(record=True, width=80)
     sidebar = render_session_sidebar(FakeSession())
     panels = [renderable for renderable in sidebar.renderables if isinstance(renderable, Panel)]
 
-    assert len(panels) == 5
-    assert all(renderable.box == box.SQUARE for renderable in panels)
-    assert {str(renderable.border_style) for renderable in panels} == {"#141922"}
+    console.print(sidebar)
+
+    output = console.export_text()
+    assert panels == []
+    assert "session" in output
+    assert "context" in output
+    assert "┌" not in output
+    assert "│" not in output
 
 
 def test_session_sidebar_lists_multiple_context_files() -> None:

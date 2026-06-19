@@ -5,7 +5,6 @@ from pathlib import Path
 from subprocess import TimeoutExpired, run
 from typing import Any, Protocol
 
-from rich import box
 from rich.align import Align
 from rich.console import Console, Group, RenderableType
 from rich.markdown import Markdown
@@ -199,42 +198,23 @@ def render_session_sidebar(
 
     return Group(
         Padding(Align.center(equation), (0, 0, 1, 0)),
-        Panel(
-            metadata,
-            title="session",
-            box=box.SQUARE,
-            border_style=theme.border,
-            padding=(0, 1),
-        ),
-        Panel(
-            context,
-            title="context",
-            box=box.SQUARE,
-            border_style=theme.border,
-            padding=(0, 1),
-        ),
-        Panel(
-            tools,
-            title="tools",
-            box=box.SQUARE,
-            border_style=theme.border,
-            padding=(0, 1),
-        ),
-        Panel(
-            skills,
-            title="skills",
-            box=box.SQUARE,
-            border_style=theme.border,
-            padding=(0, 1),
-        ),
-        Panel(
-            prompts,
-            title="prompts",
-            box=box.SQUARE,
-            border_style=theme.border,
-            padding=(0, 1),
-        ),
+        _sidebar_section("session", metadata, theme=theme),
+        _sidebar_section("context", context, theme=theme),
+        _sidebar_section("tools", tools, theme=theme),
+        _sidebar_section("skills", skills, theme=theme),
+        _sidebar_section("prompts", prompts, theme=theme),
     )
+
+
+def _sidebar_section(
+    title: str,
+    body: RenderableType,
+    *,
+    theme: TuiTheme,
+) -> RenderableType:
+    """Render one sidebar section without a surrounding border."""
+    header = Text(title, style=f"bold {theme.completion_description}")
+    return Group(header, Padding(body, (0, 0, 1, 1)))
 
 
 def render_compact_session_info(
