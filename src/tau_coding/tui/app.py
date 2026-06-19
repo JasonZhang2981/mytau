@@ -1847,6 +1847,7 @@ class TauTuiApp(App[None]):
             thinking_levels=getattr(self.session, "available_thinking_levels", ()),
             theme_names=BUILTIN_TUI_THEME_NAMES,
             session_options=_session_options(self.session),
+            cwd=self.session.cwd,
         )
 
     def _refresh_footer_bindings(self) -> None:

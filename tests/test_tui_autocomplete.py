@@ -196,3 +196,38 @@ def test_resume_argument_completion_uses_session_options_with_descriptions() -> 
         "Newer - qwen - /repo",
         "Older - gpt - /repo",
     ]
+
+
+def test_file_reference_completion_matches_workspace_files(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("# Project\n", encoding="utf-8")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("print('hi')\n", encoding="utf-8")
+    (tmp_path / ".hidden").write_text("secret\n", encoding="utf-8")
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "ignored.js").write_text("", encoding="utf-8")
+
+    state = build_completion_state(
+        "please read @app",
+        command_registry=create_default_command_registry(),
+        skills=(),
+        prompt_templates=(),
+        cwd=tmp_path,
+    )
+
+    assert [item.display for item in state.items] == ["@src/app.py"]
+    assert state.selected is not None
+    assert state.selected.apply("please read @app") == "please read @src/app.py"
+
+
+def test_file_reference_completion_stays_off_for_slash_commands(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("# Project\n", encoding="utf-8")
+
+    state = build_completion_state(
+        "/help @read",
+        command_registry=create_default_command_registry(),
+        skills=(),
+        prompt_templates=(),
+        cwd=tmp_path,
+    )
+
+    assert [item.display for item in state.items] == ["/help"]

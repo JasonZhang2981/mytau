@@ -2,10 +2,29 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 from tau_coding.commands import CommandRegistry, SlashCommand
 from tau_coding.prompt_templates import PromptTemplate
 from tau_coding.skills import Skill
+
+IGNORED_FILE_COMPLETION_DIRS = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tau",
+        ".tox",
+        ".venv",
+        "__pycache__",
+        "build",
+        "dist",
+        "node_modules",
+    }
+)
+MAX_FILE_COMPLETIONS = 50
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,10 +95,13 @@ def build_completion_state(
     theme_names: Sequence[str] = (),
     session_ids: Sequence[str] = (),
     session_options: Sequence[CompletionOption] = (),
+    cwd: Path | None = None,
 ) -> CompletionState:
     """Build autocomplete suggestions for the current prompt text."""
     del prompt_templates
     if not text.startswith("/") or text.startswith("//"):
+        if cwd is not None:
+            return CompletionState(_file_reference_completions(text=text, cwd=cwd))
         return CompletionState()
 
     token_end = _first_token_end(text)
@@ -108,6 +130,71 @@ def build_completion_state(
     )
 
 
+def _file_reference_completions(*, text: str, cwd: Path) -> tuple[CompletionItem, ...]:
+    token = _active_file_reference_token(text)
+    if token is None:
+        return ()
+    start, end = token
+    prefix = text[start + 1 : end]
+    suggestions: list[CompletionItem] = []
+    for path in _iter_file_reference_paths(cwd):
+        relative = path.relative_to(cwd).as_posix()
+        if prefix.lower() not in relative.lower():
+            continue
+        display = f"@{relative}{'/' if path.is_dir() else ''}"
+        suggestions.append(
+            CompletionItem(
+                display=display,
+                replacement=display,
+                start=start,
+                end=end,
+                description="File reference",
+            )
+        )
+        if len(suggestions) >= MAX_FILE_COMPLETIONS:
+            break
+    return tuple(suggestions)
+
+
+def _active_file_reference_token(text: str) -> tuple[int, int] | None:
+    cursor = len(text)
+    token_start = max(text.rfind(" ", 0, cursor), text.rfind("\n", 0, cursor)) + 1
+    at_index = text.rfind("@", token_start, cursor)
+    if at_index == -1:
+        return None
+    return at_index, cursor
+
+
+def _iter_file_reference_paths(cwd: Path) -> tuple[Path, ...]:
+    if not cwd.exists() or not cwd.is_dir():
+        return ()
+    paths: list[Path] = []
+    stack = [cwd]
+    while stack:
+        directory = stack.pop()
+        try:
+            children = sorted(directory.iterdir(), key=lambda path: path.name.lower())
+        except OSError:
+            continue
+        for child in children:
+            if _is_ignored_file_completion_path(child, cwd=cwd):
+                continue
+            paths.append(child)
+            if child.is_dir():
+                stack.append(child)
+    return tuple(paths)
+
+
+def _is_ignored_file_completion_path(path: Path, *, cwd: Path) -> bool:
+    try:
+        relative_parts = path.relative_to(cwd).parts
+    except ValueError:
+        return True
+    return any(
+        part.startswith(".") or part in IGNORED_FILE_COMPLETION_DIRS for part in relative_parts
+    )
+
+
 def _command_completions(
     *, token: str, token_end: int, registry: CommandRegistry
 ) -> tuple[CompletionItem, ...]:
@@ -122,9 +209,7 @@ def _command_alias_completions(
     command: SlashCommand, *, prefix: str, token_end: int
 ) -> list[CompletionItem]:
     names = (
-        (command.name,)
-        if not prefix
-        else (command.name, *command.aliases, *command.search_terms)
+        (command.name,) if not prefix else (command.name, *command.aliases, *command.search_terms)
     )
     suggestions: list[CompletionItem] = []
     seen: set[str] = set()

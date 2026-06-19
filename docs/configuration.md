@@ -301,6 +301,12 @@ OpenAI-compatible providers can opt in by adding `thinking_levels`,
 provider entry. Add `thinking_models` when only some configured models support
 those levels.
 
+Typing `@` in the TUI prompt opens file-reference suggestions for the current
+session working directory. Suggestions include matching files and directories
+from the project tree and insert paths such as `@src/app.py`. Tau intentionally
+skips hidden paths and common generated/cache directories such as `.git`,
+`.venv`, `node_modules`, `__pycache__`, `build`, and `dist`.
+
 ## Context Management
 
 `/status` shows a rough context-size estimate:

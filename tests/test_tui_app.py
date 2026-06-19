@@ -1120,6 +1120,28 @@ async def test_tui_app_enter_accepts_arrow_selected_completion() -> None:
 
 
 @pytest.mark.anyio
+async def test_tui_app_accepts_file_reference_completion(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("# Project\n", encoding="utf-8")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("print('hi')\n", encoding="utf-8")
+
+    session = FakeSession()
+    session.cwd = tmp_path
+    app = TauTuiApp(session)
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.value = "inspect @main"
+        app._completion_state = app._build_completion_state(prompt.value)
+        app._refresh_completions()
+
+        assert [item.display for item in app._completion_state.items] == ["@src/main.py"]
+        await pilot.press("tab")
+
+        assert prompt.value == "inspect @src/main.py"
+
+
+@pytest.mark.anyio
 async def test_tui_app_completes_skill_name() -> None:
     app = TauTuiApp(FakeSession())
 
