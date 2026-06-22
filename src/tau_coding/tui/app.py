@@ -2315,6 +2315,11 @@ class TauTuiApp(App[None]):
             self._notify("Session tree is not available.", severity="warning")
             return
         try:
+            if summarize:
+                self.state.clear()
+                self.state.add_item("status", "Summarizing branch…")
+                self._refresh()
+
             result = branch_to_entry(
                 entry_id,
                 summarize=summarize,

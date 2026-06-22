@@ -1804,6 +1804,52 @@ async def test_tui_app_tree_picker_branches_with_summary() -> None:
 
 
 @pytest.mark.anyio
+async def test_tui_app_tree_summary_clears_transcript_while_summarizing() -> None:
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    class SlowSummarySession(FakeSession):
+        async def branch_to_entry(
+            self,
+            entry_id: str,
+            *,
+            summarize: bool = False,
+            custom_instructions: str | None = None,
+        ) -> str:
+            self.tree_branch_requests.append((entry_id, summarize, custom_instructions))
+            started.set()
+            await finish.wait()
+            self.messages = (UserMessage(content=f"Branched to {entry_id}"),)
+            return f"Branched session at {entry_id}."
+
+    session = SlowSummarySession(messages=[UserMessage(content="Old thread")])
+    app = TauTuiApp(session)
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.value = "/tree"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        await pilot.press("up")
+        await pilot.press("s")
+        await pilot.pause()
+        await started.wait()
+
+        assert [(item.role, item.text) for item in app.state.items] == [
+            ("status", "Summarizing branch…"),
+        ]
+
+        finish.set()
+        await pilot.pause()
+
+        assert session.tree_branch_requests == [("left", True, None)]
+        assert [(item.role, item.text) for item in app.state.items] == [
+            ("user", "Branched to left"),
+        ]
+
+
+@pytest.mark.anyio
 async def test_tui_app_tree_picker_toggles_tool_calls() -> None:
     session = FakeSession()
     app = TauTuiApp(session)
