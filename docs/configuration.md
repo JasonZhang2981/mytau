@@ -235,8 +235,9 @@ in the `/resume` picker and in session-id completions.
 
 `/tree` opens the current session tree. Select an earlier entry with `Enter` to
 continue from that point while preserving the existing branch. Press `S` instead
-to ask the active model for a concise branch summary of the messages left behind
-before Tau moves the active leaf. If that summary request is unavailable or
+to ask the active model for a structured branch summary of the messages left
+behind before Tau moves the active leaf. Press `C` to provide custom focus
+instructions for that one summary. If the summary request is unavailable or
 fails, Tau falls back to the deterministic summary formatter.
 
 ## Skills and Prompt Templates

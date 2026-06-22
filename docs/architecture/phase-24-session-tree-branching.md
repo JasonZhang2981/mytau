@@ -31,10 +31,13 @@ converts it into a user-context summary message.
 
 Branch summaries now use the active provider and model to summarize active-path
 messages after the selected entry. `CodingSession` sends a one-off summarization
-request outside the main `AgentHarness` transcript, then stores the resulting
-text in the existing `BranchSummaryEntry` shape. If the provider returns no
-usable text, reports an error, or raises, Tau falls back to the same
-deterministic summary helper used by automatic compaction.
+request outside the main `AgentHarness` transcript, using a Pi-style structured
+summary prompt with sections for goal, constraints, progress, decisions, and
+next steps. The TUI supports both the default prompt and per-branch custom
+focus instructions. Tau stores the resulting text in the existing
+`BranchSummaryEntry` shape. If the provider returns no usable text, reports an
+error, or raises, Tau falls back to the same deterministic summary helper used
+by automatic compaction.
 
 ## Boundaries
 

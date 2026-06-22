@@ -363,7 +363,14 @@ class CodingSession:
             if _is_branchable_tree_entry(entry)
         )
 
-    async def branch_to_entry(self, entry_id: str, *, summarize: bool = False) -> str:
+    async def branch_to_entry(
+        self,
+        entry_id: str,
+        *,
+        summarize: bool = False,
+        custom_instructions: str | None = None,
+        replace_instructions: bool = False,
+    ) -> str:
         """Move the active leaf to a previous entry, preserving existing history."""
         entries = await self._config.storage.read_all()
         by_id = {entry.id: entry for entry in entries}
@@ -381,7 +388,11 @@ class CodingSession:
                 self._last_parent_id,
             )
             if abandoned_messages:
-                summary = await self._summarize_branch_messages(abandoned_messages)
+                summary = await self._summarize_branch_messages(
+                    abandoned_messages,
+                    custom_instructions=custom_instructions,
+                    replace_instructions=replace_instructions,
+                )
                 summary_entry = BranchSummaryEntry(
                     parent_id=entry_id,
                     branch_root_id=entry_id,
@@ -1148,12 +1159,20 @@ class CodingSession:
         summary = summarize_messages_for_compaction(self._state.messages)
         await self._append_compaction(summary)
 
-    async def _summarize_branch_messages(self, messages: tuple[AgentMessage, ...]) -> str:
+    async def _summarize_branch_messages(
+        self,
+        messages: tuple[AgentMessage, ...],
+        *,
+        custom_instructions: str | None = None,
+        replace_instructions: bool = False,
+    ) -> str:
         try:
             summary = await summarize_branch_messages_with_model(
                 provider=self._harness.config.provider,
                 model=self.model,
                 messages=messages,
+                custom_instructions=custom_instructions,
+                replace_instructions=replace_instructions,
             )
         except Exception:
             summary = None
