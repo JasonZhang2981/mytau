@@ -94,6 +94,11 @@ class SessionManager:
                 return record
         return None
 
+    def latest_session_for_cwd(self, cwd: Path) -> CodingSessionRecord | None:
+        """Return the most recently updated session for a working directory."""
+        records = self.list_sessions(cwd)
+        return records[0] if records else None
+
     def create_session(
         self,
         *,

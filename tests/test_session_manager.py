@@ -37,6 +37,22 @@ def test_session_manager_filters_sessions_by_project_cwd(tmp_path: Path) -> None
     assert {record.id for record in manager.list_sessions()} == {first.id, second.id}
 
 
+def test_session_manager_returns_latest_session_for_cwd(tmp_path: Path) -> None:
+    manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    older = manager.create_session(cwd=cwd, model="older", session_id="older")
+    newer = manager.create_session(cwd=cwd, model="newer", session_id="newer")
+    manager.touch_session(older.id)
+
+    latest = manager.latest_session_for_cwd(cwd)
+
+    assert latest is not None
+    assert latest.id == older.id
+    assert latest.model == "older"
+    assert newer in manager.list_sessions(cwd)
+
+
 def test_session_manager_gets_or_creates_default_session(tmp_path: Path) -> None:
     manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
     cwd = tmp_path / "project"
