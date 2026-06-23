@@ -128,6 +128,36 @@ class WaitingProvider:
         return iterator()
 
 
+class CancellableWaitingProvider:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls: list[list[AgentMessage]] = []
+
+    def stream_response(
+        self,
+        *,
+        model: str,
+        system: str,
+        messages: list[AgentMessage],
+        tools: list[AgentTool],
+        signal: CancellationToken | None = None,
+    ) -> AsyncIterator[ProviderEvent]:
+        del model, system, tools
+        self.calls.append(list(messages))
+
+        async def iterator() -> AsyncIterator[ProviderEvent]:
+            yield ProviderResponseStartEvent(model="fake")
+            self.started.set()
+            while not self.release.is_set():
+                if signal is not None and signal.is_cancelled():
+                    return
+                await asyncio.sleep(0)
+            yield ProviderResponseEndEvent(message=AssistantMessage(content="Finished"))
+
+        return iterator()
+
+
 @pytest.mark.anyio
 async def test_load_empty_session_defers_transcript_file(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
@@ -236,10 +266,12 @@ async def test_prompt_persists_user_assistant_and_leaf_entries(tmp_path: Path) -
         timestamp=entries[2].timestamp,
     )
     message_entries = [entry for entry in entries if entry.type == "message"]
+    leaf_entries = [entry for entry in entries if entry.type == "leaf"]
     assert [entry.message for entry in message_entries] == [
         UserMessage(content="Hello"),
         AssistantMessage(content="Hi"),
     ]
+    assert [entry.entry_id for entry in leaf_entries] == [entry.id for entry in message_entries]
     assert entries[-1].type == "leaf"
     assert entries[-1].entry_id == message_entries[-1].id
     assert session.messages == (UserMessage(content="Hello"), AssistantMessage(content="Hi"))
@@ -317,7 +349,12 @@ async def test_prompt_queues_steering_while_session_is_running(tmp_path: Path) -
     await task
 
     assert queue_events == [QueueUpdateEvent(steering=("Queued steering",))]
-    assert entries_before_release == []
+    before_release_messages = [entry.message for entry in entries_before_release if entry.type == "message"]
+    assert before_release_messages == [UserMessage(content="Hello")]
+    assert entries_before_release[-1].type == "leaf"
+    assert entries_before_release[-1].entry_id == next(
+        entry.id for entry in entries_before_release if entry.type == "message"
+    )
     assert session.messages == (
         UserMessage(content="Hello"),
         AssistantMessage(content="First"),
@@ -327,8 +364,40 @@ async def test_prompt_queues_steering_while_session_is_running(tmp_path: Path) -
     assert provider.calls[1] == list(session.messages[:3])
     entries = await storage.read_all()
     message_entries = [entry for entry in entries if entry.type == "message"]
+    leaf_entries = [entry for entry in entries if entry.type == "leaf"]
     assert [entry.message for entry in message_entries] == list(session.messages)
+    assert [entry.entry_id for entry in leaf_entries] == [entry.id for entry in message_entries]
     assert any(isinstance(event, QueueUpdateEvent) for event in run_events)
+
+
+@pytest.mark.anyio
+async def test_tree_can_branch_from_first_user_message_before_assistant_response(
+    tmp_path: Path,
+) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = CancellableWaitingProvider()
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+
+    async def run_prompt() -> None:
+        async for _event in session.prompt("Start here"):
+            pass
+
+    task = asyncio.create_task(run_prompt())
+    await provider.started.wait()
+
+    choices = await session.tree_choices()
+
+    session.cancel()
+    await task
+    result = await session.branch_to_entry(choices[0].entry_id)
+    entries = await storage.read_all()
+    message_entries = [entry for entry in entries if entry.type == "message"]
+
+    assert [choice.label for choice in choices] == ["user: Start here"]
+    assert result == f"Branched session at {choices[0].entry_id}."
+    assert [entry.message for entry in message_entries] == [UserMessage(content="Start here")]
+    assert isinstance(entries[-1], LeafEntry)
+    assert entries[-1].entry_id == choices[0].entry_id
 
 
 @pytest.mark.anyio
