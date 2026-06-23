@@ -10,6 +10,7 @@ from tau_agent import (
     AgentHarness,
     AgentHarnessConfig,
     ErrorEvent,
+    MessageEndEvent,
     QueuedMessages,
     QueueUpdateEvent,
 )
@@ -424,19 +425,12 @@ class CodingSession:
         await self._append_session_entry(leaf)
         self._last_parent_id = target_id
 
-        entries = await self._config.storage.read_all()
-        self._state = SessionState.from_entries(entries, leaf_id=target_id)
+        await self._refresh_persisted_state(leaf_id=target_id)
         self._harness.replace_messages(self._state.messages)
         self._harness.config.model = self._state.model or self._config.model
         self._thinking_level = _state_thinking_level(self._state, self._config.thinking_level)
         self._sync_thinking_level_to_active_model()
         self._refresh_runtime_provider()
-        if self._config.session_id is not None and self._config.session_manager is not None:
-            self._config.session_manager.touch_session(
-                self._config.session_id,
-                model=self.model,
-                provider_name=self.provider_name,
-            )
         suffix = " with branch summary" if summary_entry is not None else ""
         return f"Branched session at {target_id}{suffix}."
 
@@ -740,14 +734,7 @@ class CodingSession:
         await self._append_session_entry(leaf)
         self._last_parent_id = entry.id
 
-        entries = await self._config.storage.read_all()
-        self._state = SessionState.from_entries(entries, leaf_id=entry.id)
-        if self._config.session_id is not None and self._config.session_manager is not None:
-            self._config.session_manager.touch_session(
-                self._config.session_id,
-                model=self.model,
-                provider_name=self.provider_name,
-            )
+        await self._refresh_persisted_state(leaf_id=entry.id)
         return f"Thinking mode: {normalized}"
 
     async def cycle_thinking_level(self) -> str:
@@ -1060,7 +1047,7 @@ class CodingSession:
                     )
                 )
             )
-            await self._persist_new_messages(before_count)
+            await self._persist_messages_since(before_count)
 
         return TerminalCommandResult(
             command=normalized_command,
@@ -1102,10 +1089,12 @@ class CodingSession:
             )
 
         await self._try_auto_compact(context=context, phase="auto_compact_before_prompt")
-        before_count = len(self._harness.messages)
+        persisted_count = len(self._harness.messages)
         overflow_event: ErrorEvent | None = None
         try:
             async for event in self._harness.prompt(expanded_content):
+                if isinstance(event, MessageEndEvent):
+                    persisted_count = await self._persist_messages_since(persisted_count)
                 if isinstance(event, ErrorEvent) and not event.recoverable:
                     self._last_diagnostic_log_path = self._diagnostic_logger.log_error_event(
                         context=context,
@@ -1115,12 +1104,16 @@ class CodingSession:
                     if _is_context_overflow_error(event):
                         overflow_event = event
                 yield event
+            persisted_count = await self._persist_messages_since(persisted_count)
             if overflow_event is not None:
-                await self._persist_new_messages(before_count)
                 compacted = await self._try_overflow_compact(context=context)
                 if compacted:
-                    retry_before_count = len(self._harness.messages)
+                    retry_persisted_count = len(self._harness.messages)
                     async for retry_event in self._harness.continue_():
+                        if isinstance(retry_event, MessageEndEvent):
+                            retry_persisted_count = await self._persist_messages_since(
+                                retry_persisted_count
+                            )
                         if isinstance(retry_event, ErrorEvent) and not retry_event.recoverable:
                             self._last_diagnostic_log_path = (
                                 self._diagnostic_logger.log_error_event(
@@ -1130,9 +1123,8 @@ class CodingSession:
                                 )
                             )
                         yield retry_event
-                    await self._persist_new_messages(retry_before_count)
+                    await self._persist_messages_since(retry_persisted_count)
                 return
-            await self._persist_new_messages(before_count)
             await self._try_auto_compact(context=context, phase="auto_compact_after_prompt")
         except Exception as exc:
             self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
@@ -1145,9 +1137,11 @@ class CodingSession:
     async def continue_(self) -> AsyncIterator[AgentEvent]:
         """Continue the agent from restored state and persist new messages."""
         context = self._diagnostic_context()
-        before_count = len(self._harness.messages)
+        persisted_count = len(self._harness.messages)
         try:
             async for event in self._harness.continue_():
+                if isinstance(event, MessageEndEvent):
+                    persisted_count = await self._persist_messages_since(persisted_count)
                 if isinstance(event, ErrorEvent) and not event.recoverable:
                     self._last_diagnostic_log_path = self._diagnostic_logger.log_error_event(
                         context=context,
@@ -1155,7 +1149,7 @@ class CodingSession:
                         event=event,
                     )
                 yield event
-            await self._persist_new_messages(before_count)
+            await self._persist_messages_since(persisted_count)
             await self._try_auto_compact(context=context, phase="auto_compact_after_continue")
         except Exception as exc:
             self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
@@ -1174,23 +1168,30 @@ class CodingSession:
             run_id=new_agent_call_run_id(),
         )
 
-    async def _persist_new_messages(self, before_count: int) -> None:
-        new_messages = self._harness.messages[before_count:]
+    async def _persist_messages_since(self, persisted_count: int) -> int:
+        """Persist completed harness messages after ``persisted_count``.
+
+        Message lifecycle events are the durable-message boundary. Each persisted
+        message advances the append-only tree and records a leaf pointer so tree
+        navigation can observe the current branch while a run is still active.
+        """
+        new_messages = self._harness.messages[persisted_count:]
         if not new_messages:
-            return
-        last_message_entry_id: str | None = None
+            return persisted_count
+
         for message in new_messages:
             entry = MessageEntry(parent_id=self._last_parent_id, message=message)
             await self._append_session_entry(entry)
             self._last_parent_id = entry.id
-            last_message_entry_id = entry.id
-
-        if last_message_entry_id is not None:
-            leaf = LeafEntry(parent_id=last_message_entry_id, entry_id=last_message_entry_id)
+            leaf = LeafEntry(parent_id=entry.id, entry_id=entry.id)
             await self._append_session_entry(leaf)
 
+        await self._refresh_persisted_state()
+        return persisted_count + len(new_messages)
+
+    async def _refresh_persisted_state(self, *, leaf_id: str | None = None) -> None:
         entries = await self._config.storage.read_all()
-        self._state = SessionState.from_entries(entries)
+        self._state = SessionState.from_entries(entries, leaf_id=leaf_id)
         if self._config.session_id is not None and self._config.session_manager is not None:
             self._config.session_manager.touch_session(
                 self._config.session_id,
@@ -1378,15 +1379,8 @@ class CodingSession:
         await self._append_session_entry(leaf)
         self._last_parent_id = compaction.id
 
-        entries = await self._config.storage.read_all()
-        self._state = SessionState.from_entries(entries, leaf_id=compaction.id)
+        await self._refresh_persisted_state(leaf_id=compaction.id)
         self._harness.replace_messages(self._state.messages)
-        if self._config.session_id is not None and self._config.session_manager is not None:
-            self._config.session_manager.touch_session(
-                self._config.session_id,
-                model=self.model,
-                provider_name=self.provider_name,
-            )
         return compaction
 
 

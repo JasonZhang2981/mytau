@@ -35,6 +35,21 @@ Tau can now:
 - reconstruct a root-to-leaf branch path
 - load a `tau_coding.CodingSession` that restores messages and persists new runs
 
+## Durable message boundary
+
+`CodingSession` treats `MessageEndEvent` as the durable-message boundary. When the harness emits a completed message, the coding session appends that message to storage immediately instead of waiting for the whole agent run to finish.
+
+This mirrors Pi's session model and matters for interactive UIs:
+
+- the first user prompt is branchable while the assistant is still responding
+- queued steering and follow-up messages become durable when they are injected
+- cancellation or process failure preserves completed messages
+- the TUI can read tree state that matches the active run
+
+Each persisted message is followed by a `leaf` entry pointing at that message. The leaf entries form an append-only history of the active branch pointer.
+
+Empty sessions are still deferred: loading a new session prepares initial metadata in memory, but Tau does not create the transcript file until the first durable session entry is appended. The first append materializes the pending `session_info`, model, and thinking-level entries before writing the message.
+
 ## Boundary
 
 Low-level session primitives belong in `tau_agent`. File locations, slash commands, and coding-agent workflows belong in `tau_coding`.
