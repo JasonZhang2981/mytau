@@ -99,6 +99,8 @@ class CommandResult:
     tree_picker_requested: bool = False
     login_picker_requested: bool = False
     login_provider: str | None = None
+    logout_picker_requested: bool = False
+    logout_provider: str | None = None
     model_picker_requested: bool = False
     scoped_models_picker_requested: bool = False
     theme_picker_requested: bool = False
@@ -309,6 +311,14 @@ def create_default_command_registry() -> CommandRegistry:
             usage="/login [provider]",
             description="Save an API key for a built-in provider.",
             handler=_login_command,
+        )
+    )
+    registry.register(
+        SlashCommand(
+            name="logout",
+            usage="/logout [provider]",
+            description="Remove saved credentials for a built-in provider.",
+            handler=_logout_command,
         )
     )
     return registry
@@ -649,6 +659,23 @@ def _login_command(context: CommandContext) -> CommandResult:
         return CommandResult(handled=True, login_provider=entry.name)
 
     return CommandResult(handled=True, login_picker_requested=True)
+
+
+def _logout_command(context: CommandContext) -> CommandResult:
+    provider_name = context.args.strip()
+    if provider_name:
+        entry = builtin_provider_entry(provider_name)
+        if entry is None:
+            providers = ", ".join(entry.name for entry in BUILTIN_PROVIDER_CATALOG)
+            return CommandResult(
+                handled=True,
+                message=(
+                    f"Unknown logout provider: {provider_name}\nAvailable providers: {providers}"
+                ),
+            )
+        return CommandResult(handled=True, logout_provider=entry.name)
+
+    return CommandResult(handled=True, logout_picker_requested=True)
 
 
 def _format_session_record(record: CodingSessionRecord) -> str:

@@ -162,13 +162,17 @@ The easiest path is from inside the TUI:
 /login
 /login openai
 /login openai-codex
+/logout
+/logout openai
 /model
 ```
 
 `/login` can save API-key credentials for built-in providers or authenticate an
 OpenAI Codex subscription account with OAuth. Credentials are stored in
 `~/.tau/credentials.json` with private file permissions. Provider metadata lives
-in `~/.tau/providers.json`.
+in `~/.tau/providers.json`. `/logout` removes only credentials saved in Tau's
+`credentials.json`; environment variables and provider configuration are
+unchanged.
 
 You can also configure an OpenAI-compatible provider from the CLI:
 
@@ -203,6 +207,7 @@ Common slash commands:
 | Command | Purpose |
 | --- | --- |
 | `/login [provider]` | Save or refresh provider credentials. |
+| `/logout [provider]` | Remove Tau-saved provider credentials. |
 | `/model` | Choose the active provider/model. |
 | `/scoped-models` | Pick models available for quick cycling. |
 | `/session` | Show session and context information. |

@@ -150,6 +150,18 @@ def test_login_argument_completion_uses_available_providers() -> None:
     assert [item.display for item in state.items] == ["openai", "openrouter"]
 
 
+def test_logout_argument_completion_uses_available_providers() -> None:
+    state = build_completion_state(
+        "/logout op",
+        command_registry=create_default_command_registry(),
+        skills=(),
+        prompt_templates=(),
+        provider_names=("openai", "openrouter", "anthropic"),
+    )
+
+    assert [item.display for item in state.items] == ["openai", "openrouter"]
+
+
 def test_thinking_argument_completion_uses_available_modes() -> None:
     state = build_completion_state(
         "/thinking h",

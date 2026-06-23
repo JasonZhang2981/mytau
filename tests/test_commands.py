@@ -99,6 +99,7 @@ def test_registered_commands_are_pi_aligned(tmp_path: Path) -> None:
         "export",
         "hotkeys",
         "login",
+        "logout",
         "model",
         "name",
         "new",
@@ -307,6 +308,28 @@ def test_login_command_requests_provider_login(tmp_path: Path) -> None:
 
     assert result.handled is True
     assert result.login_provider == "openai"
+
+
+def test_logout_command_requests_provider_picker(tmp_path: Path) -> None:
+    result = create_default_command_registry().execute(FakeSession(tmp_path), "/logout")
+
+    assert result.handled is True
+    assert result.logout_picker_requested is True
+
+
+def test_logout_command_requests_provider_logout(tmp_path: Path) -> None:
+    result = create_default_command_registry().execute(FakeSession(tmp_path), "/logout openai")
+
+    assert result.handled is True
+    assert result.logout_provider == "openai"
+
+
+def test_logout_command_rejects_unknown_provider(tmp_path: Path) -> None:
+    result = create_default_command_registry().execute(FakeSession(tmp_path), "/logout local")
+
+    assert result.handled is True
+    assert result.message is not None
+    assert "Unknown logout provider: local" in result.message
 
 
 def test_reload_command_refreshes_session_resources(tmp_path: Path) -> None:

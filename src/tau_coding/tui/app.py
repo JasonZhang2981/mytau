@@ -104,6 +104,10 @@ SIDEBAR_MIN_HEIGHT = 24
 ACTIVITY_TICK_SECONDS = 0.15
 ACTIVITY_COLOR_FADE_STEPS = 24
 ACTIVITY_INDICATOR_HEIGHT = 3
+NO_STORED_CREDENTIALS_MESSAGE = (
+    "No stored credentials to remove. /logout only removes credentials saved by /login; "
+    "environment variables and providers.json config are unchanged."
+)
 
 
 class LoginRequiredProvider:
@@ -758,15 +762,17 @@ class LoginProviderPickerScreen(ModalScreen[str | None]):
         providers: Sequence[ProviderCatalogEntry],
         *,
         theme: TuiTheme,
+        title: str = "Login",
     ) -> None:
         super().__init__()
         self.providers = tuple(providers)
         self.theme = theme
+        self.title = title
 
     def compose(self) -> ComposeResult:
         """Compose the provider picker."""
         with Vertical(id="login-provider-picker"):
-            yield Static("Login", id="login-provider-title")
+            yield Static(self.title, id="login-provider-title")
             yield ListView(
                 *[
                     ListItem(Label(_login_provider_label(provider), markup=False))
@@ -1926,6 +1932,10 @@ class TauTuiApp(App[None]):
                 self._open_login_picker()
             if command.login_provider is not None:
                 self._open_login(command.login_provider)
+            if command.logout_picker_requested:
+                self._open_logout_picker()
+            if command.logout_provider is not None:
+                self._logout(command.logout_provider)
             if command.model_picker_requested:
                 self._open_model_picker()
             if command.scoped_models_picker_requested:
@@ -2461,6 +2471,52 @@ class TauTuiApp(App[None]):
         self._notify(f"Saved login for {entry.display_name}.")
         self._refresh()
 
+    def _open_logout_picker(self) -> None:
+        providers = _stored_credential_providers(BUILTIN_PROVIDER_CATALOG)
+        if not providers:
+            self._notify(NO_STORED_CREDENTIALS_MESSAGE, severity="warning")
+            return
+        self.push_screen(
+            LoginProviderPickerScreen(
+                providers,
+                theme=self.tui_settings.resolved_theme,
+                title="Logout",
+            ),
+            callback=self._handle_logout_provider_result,
+        )
+
+    def _handle_logout_provider_result(self, provider_name: str | None) -> None:
+        if provider_name is None:
+            return
+        self._logout(provider_name)
+
+    def _logout(self, provider_name: str) -> None:
+        entry = builtin_provider_entry(provider_name)
+        if entry is None:
+            self._notify(f"Unknown provider: {provider_name}", severity="error")
+            return
+
+        credential_store = FileCredentialStore()
+        if not _credential_store_has_entry(credential_store, entry.credential_name):
+            self._notify(NO_STORED_CREDENTIALS_MESSAGE, severity="warning")
+            return
+
+        try:
+            credential_store.delete(entry.credential_name)
+            self.session.reload_provider_settings()
+        except Exception as exc:  # noqa: BLE001 - surface logout failures in the TUI
+            self._notify(f"Could not log out: {exc}", severity="error")
+            return
+
+        if entry.kind == "openai-codex":
+            self._notify(f"Logged out of {entry.display_name}.")
+        else:
+            self._notify(
+                f"Removed stored API key for {entry.display_name}. "
+                "Environment variables and providers.json config are unchanged."
+            )
+        self._refresh()
+
     def _available_model_choices(self) -> tuple[ModelChoice, ...]:
         fallback_choices = (
             ModelChoice(provider_name=self.session.provider_name, model=model)
@@ -2928,6 +2984,27 @@ def _api_key_login_providers(
     providers: Sequence[ProviderCatalogEntry],
 ) -> tuple[ProviderCatalogEntry, ...]:
     return tuple(provider for provider in providers if provider.kind != "openai-codex")
+
+
+def _stored_credential_providers(
+    providers: Sequence[ProviderCatalogEntry],
+) -> tuple[ProviderCatalogEntry, ...]:
+    credential_store = FileCredentialStore()
+    return tuple(
+        provider
+        for provider in providers
+        if _credential_store_has_entry(credential_store, provider.credential_name)
+    )
+
+
+def _credential_store_has_entry(
+    credential_store: FileCredentialStore,
+    credential_name: str,
+) -> bool:
+    return (
+        credential_store.get(credential_name) is not None
+        or credential_store.get_oauth(credential_name) is not None
+    )
 
 
 def _theme_picker_label(theme_name: TuiThemeName, *, current_theme: TuiThemeName) -> str:

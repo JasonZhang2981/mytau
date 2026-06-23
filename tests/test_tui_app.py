@@ -163,6 +163,10 @@ class FakeSession:
             return CommandResult(handled=True, login_picker_requested=True)
         if text.startswith("/login "):
             return CommandResult(handled=True, login_provider=text.removeprefix("/login "))
+        if text == "/logout":
+            return CommandResult(handled=True, logout_picker_requested=True)
+        if text.startswith("/logout "):
+            return CommandResult(handled=True, logout_provider=text.removeprefix("/logout "))
         if text == "/model":
             return CommandResult(handled=True, model_picker_requested=True)
         if text in {"/scoped-models", "/scoped models"}:
@@ -2426,6 +2430,124 @@ async def test_tui_login_provider_does_not_change_default_startup_provider(
     assert session.provider_reload_count == 1
     assert session.provider_name == "openrouter"
     assert tui_app.load_provider_settings().default_provider == "openai"
+
+
+@pytest.mark.anyio
+async def test_tui_logout_without_stored_credentials_shows_message(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    session = FakeSession()
+    app = TauTuiApp(session)
+    notifications: list[tuple[str, str | None]] = []
+
+    def fake_notify(message: str, **kwargs: object) -> None:
+        severity = kwargs.get("severity")
+        notifications.append((message, severity if isinstance(severity, str) else None))
+
+    app._notify = fake_notify  # type: ignore[method-assign]
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.value = "/logout"
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert notifications == [(tui_app.NO_STORED_CREDENTIALS_MESSAGE, "warning")]
+    assert session.provider_reload_count == 0
+
+
+@pytest.mark.anyio
+async def test_tui_logout_removes_stored_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    credential_path = tmp_path / ".tau" / "credentials.json"
+    FileCredentialStore(credential_path).set("openai", "stored-openai-key")
+    session = FakeSession()
+    app = TauTuiApp(session)
+    notifications: list[str] = []
+
+    def fake_notify(message: str, **kwargs: object) -> None:
+        del kwargs
+        notifications.append(message)
+
+    app._notify = fake_notify  # type: ignore[method-assign]
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.value = "/logout openai"
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert FileCredentialStore(credential_path).get("openai") is None
+    assert session.provider_reload_count == 1
+    assert notifications == [
+        "Removed stored API key for OpenAI. "
+        "Environment variables and providers.json config are unchanged."
+    ]
+
+
+@pytest.mark.anyio
+async def test_tui_logout_removes_oauth_credential(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    credential_path = tmp_path / ".tau" / "credentials.json"
+    FileCredentialStore(credential_path).set_oauth(
+        "openai-codex",
+        OAuthCredential(
+            access="access-token",
+            refresh="refresh-token",
+            expires=123456,
+            account_id="account-1",
+        ),
+    )
+    session = FakeSession()
+    app = TauTuiApp(session)
+    notifications: list[str] = []
+
+    def fake_notify(message: str, **kwargs: object) -> None:
+        del kwargs
+        notifications.append(message)
+
+    app._notify = fake_notify  # type: ignore[method-assign]
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.value = "/logout openai-codex"
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert FileCredentialStore(credential_path).get_oauth("openai-codex") is None
+    assert session.provider_reload_count == 1
+    assert notifications == ["Logged out of OpenAI Codex subscription."]
+
+
+@pytest.mark.anyio
+async def test_tui_logout_opens_stored_credential_provider_picker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    FileCredentialStore(tmp_path / ".tau" / "credentials.json").set("anthropic", "stored-key")
+    app = TauTuiApp(FakeSession())
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.value = "/logout"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert isinstance(app.screen, LoginProviderPickerScreen)
+        title = app.screen.query_one("#login-provider-title", Static)
+        assert str(title.render()) == "Logout"
+        provider_list = app.screen.query_one("#login-provider-list", ListView)
+        labels = [str(item.query_one(Label).render()) for item in provider_list.children]
+        assert labels == ["Anthropic\n  anthropic"]
 
 
 @pytest.mark.anyio

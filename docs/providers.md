@@ -126,6 +126,7 @@ Inside the TUI:
 /model
 /model qwen
 /login
+/logout
 ```
 
 `/model` opens the interactive model picker. The picker includes models from
@@ -133,7 +134,9 @@ configured providers, so selecting a model can also switch the active runtime
 provider. The model flow refreshes provider settings before it validates or
 shows choices. `/login` adds or refreshes a built-in provider, including
 OAuth-backed providers such as `openai-codex`, and refreshes provider settings
-after saving credentials.
+after saving credentials. `/logout` opens a picker for providers with saved Tau
+credentials, while `/logout <provider>` removes a specific saved credential. It
+does not change environment variables, `providers.json`, billing, or defaults.
 
 When Tau loads `~/.tau/providers.json`, it merges the current built-in model
 catalog into built-in provider entries such as Hugging Face. Custom models and

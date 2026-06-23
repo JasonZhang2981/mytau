@@ -83,7 +83,9 @@ authentication headers under runtime control.
 OAuth-backed providers, such as `openai-codex`, store a structured credential
 object in `~/.tau/credentials.json` and refresh expired access tokens before a
 model request. Use `/login openai-codex` to authenticate with a Codex
-subscription account.
+subscription account. Use `/logout` to choose a saved Tau credential to remove,
+or `/logout <provider>` to remove one directly. Logout only edits
+`credentials.json`; environment variables and `providers.json` are unchanged.
 
 For example, Hugging Face organization billing can be configured with:
 
