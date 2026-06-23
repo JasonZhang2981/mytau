@@ -543,22 +543,32 @@ def _transcript_plain_body_text(
     text: str,
     body_style: str,
     theme: TuiTheme,
-) -> Text:
-    """Return styled plain transcript text for fast selectable rows."""
+) -> RenderableType:
+    """Return styled transcript text for selectable plain rows."""
     if item.role != "tool":
         return Text(text, style=body_style, overflow="fold", no_wrap=False)
-    rendered = Text(style=body_style, overflow="fold", no_wrap=False)
+
     invocation, separator, result_text = text.partition("\n\n")
-    rendered.append(
-        _render_transcript_tool_invocation(
-            invocation,
-            body_style=body_style,
-            accent_style=_tool_accent_style(item, theme=theme),
-        )
+    invocation_text = _render_transcript_tool_invocation(
+        invocation,
+        body_style=body_style,
+        accent_style=_tool_accent_style(item, theme=theme),
     )
-    if separator:
-        rendered.append(separator)
-        rendered.append(result_text, style=body_style)
+    if not separator:
+        return invocation_text
+
+    patch_body = _render_patch_body(
+        result_text,
+        body_style=body_style,
+        syntax_theme=theme.syntax_theme,
+    )
+    if patch_body is not None:
+        return Group(invocation_text, Text(""), patch_body)
+
+    rendered = Text(style=body_style, overflow="fold", no_wrap=False)
+    rendered.append(invocation_text)
+    rendered.append(separator)
+    rendered.append(result_text, style=body_style)
     return rendered
 
 

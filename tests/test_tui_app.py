@@ -64,6 +64,7 @@ from tau_coding.tui.app import (
 from tau_coding.tui.autocomplete import CompletionItem, CompletionState
 from tau_coding.tui.config import (
     HIGH_CONTRAST_THEME,
+    TAU_DARK_THEME,
     TAU_LIGHT_THEME,
     TuiKeybindings,
     TuiSettings,
@@ -76,6 +77,7 @@ from tau_coding.tui.widgets import (
     TranscriptView,
     _compact_token_count,
     _syntax_language,
+    _transcript_plain_body_text,
     render_chat_item,
     render_compact_session_info,
     render_session_sidebar,
@@ -562,25 +564,53 @@ def test_tool_chat_items_hide_and_show_result_text() -> None:
     assert "full file contents" in expanded
 
 
+EDIT_TOOL_RESULT_WITH_PATCH = (
+    "✓ edit\n"
+    "Successfully replaced 1 block.\n"
+    "\n"
+    "Patch:\n"
+    "--- a/README.md\n"
+    "+++ b/README.md\n"
+    "@@\n"
+    "-old\n"
+    "+new"
+)
+
+
 def test_expanded_edit_tool_result_renders_patch_as_colored_diff() -> None:
     item = ChatItem(
         role="tool",
         text="→ edit README.md",
-        tool_result_text=(
-            "✓ edit\n"
-            "Successfully replaced 1 block.\n"
-            "\n"
-            "Patch:\n"
-            "--- a/README.md\n"
-            "+++ b/README.md\n"
-            "@@\n"
-            "-old\n"
-            "+new"
-        ),
+        tool_result_text=EDIT_TOOL_RESULT_WITH_PATCH,
     )
 
     console = Console(record=True, width=100, color_system="truecolor")
     console.print(render_chat_item(item, show_tool_results=True))
+
+    plain = console.export_text(clear=False)
+    styled = console.export_text(styles=True)
+    assert "Patch:" in plain
+    assert "-old" in plain
+    assert "+new" in plain
+    assert "\x1b[91;49m-old" in styled
+    assert "\x1b[92;49m+new" in styled
+
+
+def test_transcript_plain_tool_body_renders_patch_as_colored_diff() -> None:
+    item = ChatItem(
+        role="tool",
+        text="→ edit README.md",
+        tool_result_text=EDIT_TOOL_RESULT_WITH_PATCH,
+    )
+    body = _transcript_plain_body_text(
+        item,
+        text=transcript_item_selection_text(item, show_tool_results=True),
+        body_style="#cbd5e1 on #000000",
+        theme=TAU_DARK_THEME,
+    )
+
+    console = Console(record=True, width=100, color_system="truecolor")
+    console.print(body)
 
     plain = console.export_text(clear=False)
     styled = console.export_text(styles=True)
