@@ -1493,6 +1493,16 @@ class TauTuiApp(App[None]):
         margin: 0 1 1 1;
     }
 
+    #prompt-prefix {
+        width: 2;
+        height: 3;
+        padding: 0 0 0 0;
+        margin: 0;
+        content-align: center middle;
+        color: $tau-accent;
+        text-style: bold;
+    }
+
     #prompt {
         width: 1fr;
         height: auto;
@@ -1817,6 +1827,7 @@ class TauTuiApp(App[None]):
                 )
                 yield Static("", id="queued-messages")
                 with Horizontal(id="prompt-row"):
+                    yield Static("τ", id="prompt-prefix")
                     yield PromptInput(
                         placeholder="Ask Tau…  Enter submits, Shift+Enter inserts a newline",
                         id="prompt",
