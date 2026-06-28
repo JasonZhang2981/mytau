@@ -1,8 +1,9 @@
 name: Deploy documentation
 
-# Temporarily disabled until the repository is public.
-# Re-enable the push trigger to publish documentation on every main branch push.
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
