@@ -80,6 +80,7 @@ from tau_coding.session import (
     parse_terminal_command,
 )
 from tau_coding.session_manager import CodingSessionRecord, SessionManager
+from tau_coding.shell_config import load_shell_settings
 from tau_coding.thinking import DEFAULT_THINKING_LEVEL
 from tau_coding.tui.adapter import TuiEventAdapter
 from tau_coding.tui.autocomplete import (
@@ -3556,13 +3557,13 @@ def _create_startup_session_record(
     selection: ProviderSelection,
 ) -> CodingSessionRecord:
     try:
-        return manager.create_session(
+        return manager.prepare_session(
             cwd=cwd,
             model=selection.model,
             provider_name=selection.provider.name,
         )
     except TypeError:
-        return manager.create_session(cwd=cwd, model=selection.model)
+        return manager.prepare_session(cwd=cwd, model=selection.model)
 
 
 def _resolve_tui_startup_selection(
@@ -3664,6 +3665,7 @@ async def run_tui_app(
         raise RuntimeError("--resume and --new-session cannot be used together")
 
     provider_settings = load_provider_settings()
+    shell_settings = load_shell_settings()
     manager = session_manager or SessionManager()
     record = _explicit_resume_record(
         manager,
@@ -3693,12 +3695,14 @@ async def run_tui_app(
         runtime_provider_config = None
     session: CodingSession | None = None
     try:
+        index_on_first_persist = False
         if record is None:
             record = _create_startup_session_record(
                 manager,
                 cwd=cwd,
                 selection=selection,
             )
+            index_on_first_persist = manager.get_session(record.id) is None
 
         session = await CodingSession.load(
             CodingSessionConfig(
@@ -3712,6 +3716,8 @@ async def run_tui_app(
                 provider_settings=provider_settings,
                 runtime_provider_config=runtime_provider_config,
                 auto_compact_token_threshold=auto_compact_token_threshold,
+                index_on_first_persist=index_on_first_persist,
+                shell_command_prefix=shell_settings.shell_command_prefix,
             )
         )
         app = TauTuiApp(
