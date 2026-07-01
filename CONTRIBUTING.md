@@ -100,6 +100,18 @@ For user-facing behavior, update the published docs under:
 website/src/content/docs/
 ```
 
+## Release process
+
+Tau is published to PyPI as `tau-ai`. Publishing is a production release action,
+not a side effect of every commit merged to `main`.
+
+To prepare a release, intentionally bump `[project].version` in `pyproject.toml`
+and merge that change through a pull request. The PyPI workflow publishes only
+when it detects that version change, or when a maintainer uses an explicit
+release trigger such as a published GitHub Release or manual workflow dispatch.
+See [dev-notes/release-process.md](dev-notes/release-process.md) for the full
+process.
+
 ## Pull request guidelines
 
 Good Tau pull requests are small, focused, and easy to review. Please include:

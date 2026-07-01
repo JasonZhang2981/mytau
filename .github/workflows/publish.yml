@@ -4,8 +4,8 @@ on:
   push:
     branches:
       - main
-    tags:
-      - "v*"
+    paths:
+      - pyproject.toml
   release:
     types:
       - published
@@ -15,6 +15,10 @@ permissions:
   contents: read
   id-token: write
 
+concurrency:
+  group: pypi-publish
+  cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -22,6 +26,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -33,19 +39,52 @@ jobs:
         with:
           python-version-file: .python-version
 
+      - name: Read package metadata
+        id: package
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import tomllib
+
+          project = tomllib.load(open("pyproject.toml", "rb"))["project"]
+          print(f"name={project['name']}")
+          print(f"version={project['version']}")
+          PY
+
+      - name: Check publish trigger
+        id: trigger
+        run: |
+          SHOULD_PUBLISH=false
+          REASON="This workflow only publishes on an intentional release trigger."
+
+          if [ "${{ github.event_name }}" = "push" ]; then
+            BEFORE="${{ github.event.before }}"
+            CURRENT_VERSION="${{ steps.package.outputs.version }}"
+            PREVIOUS_VERSION=$(git show "${BEFORE}:pyproject.toml" 2>/dev/null | python -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["project"]["version"])' 2>/dev/null || true)
+
+            if [ -n "$PREVIOUS_VERSION" ] && [ "$PREVIOUS_VERSION" != "$CURRENT_VERSION" ]; then
+              SHOULD_PUBLISH=true
+              REASON="project.version changed from ${PREVIOUS_VERSION} to ${CURRENT_VERSION}."
+            else
+              REASON="project.version did not change; skipping PyPI publish."
+            fi
+          elif [ "${{ github.event_name }}" = "release" ]; then
+            SHOULD_PUBLISH=true
+            REASON="GitHub release was published."
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SHOULD_PUBLISH=true
+            REASON="Manual release dispatch was requested."
+          fi
+
+          echo "should_publish=${SHOULD_PUBLISH}" >> "$GITHUB_OUTPUT"
+          echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
+          echo "$REASON"
+
       - name: Check whether version is already on PyPI
         id: pypi
+        if: steps.trigger.outputs.should_publish == 'true'
         run: |
-          NAME=$(python - <<'PY'
-          import tomllib
-          print(tomllib.load(open('pyproject.toml', 'rb'))['project']['name'])
-          PY
-          )
-          VERSION=$(python - <<'PY'
-          import tomllib
-          print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])
-          PY
-          )
+          NAME="${{ steps.package.outputs.name }}"
+          VERSION="${{ steps.package.outputs.version }}"
           STATUS=$(curl -s -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/${NAME}/${VERSION}/json")
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
@@ -57,9 +96,9 @@ jobs:
           fi
 
       - name: Build package
-        if: steps.pypi.outputs.exists != 'true'
+        if: steps.trigger.outputs.should_publish == 'true' && steps.pypi.outputs.exists != 'true'
         run: uv build
 
       - name: Publish package
-        if: steps.pypi.outputs.exists != 'true'
+        if: steps.trigger.outputs.should_publish == 'true' && steps.pypi.outputs.exists != 'true'
         run: uv publish
