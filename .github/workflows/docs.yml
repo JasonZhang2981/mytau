@@ -43,6 +43,7 @@ jobs:
           path: website/dist
 
   deploy:
+    if: github.repository == 'huggingface/tau'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
