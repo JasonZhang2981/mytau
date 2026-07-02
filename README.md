@@ -167,6 +167,8 @@ can drive the built-in TUI, print mode, or a frontend you build yourself.
 
 ## Development
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for project philosophy, layer boundaries, testing expectations, and pull request guidelines.
+
 ```bash
 uv sync --dev
 uv run pytest
