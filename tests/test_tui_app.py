@@ -4935,6 +4935,44 @@ async def test_tui_login_method_picker_supports_arrow_keys() -> None:
 
 
 @pytest.mark.anyio
+async def test_tui_login_escape_returns_from_provider_picker_to_method_picker() -> None:
+    app = TauTuiApp(FakeSession())
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.value = "/login"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, LoginProviderPickerScreen)
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert isinstance(app.screen, LoginMethodPickerScreen)
+
+
+@pytest.mark.anyio
+async def test_tui_login_ctrl_d_closes_modal_without_closing_app() -> None:
+    app = TauTuiApp(FakeSession())
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.value = "/login"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, LoginProviderPickerScreen)
+
+        await pilot.press("ctrl+d")
+        await pilot.pause()
+        assert app.is_running
+        assert not isinstance(app.screen, LoginProviderPickerScreen)
+        assert not isinstance(app.screen, LoginMethodPickerScreen)
+
+
+@pytest.mark.anyio
 async def test_tui_login_subscription_opens_oauth_provider_picker() -> None:
     app = TauTuiApp(FakeSession())
 

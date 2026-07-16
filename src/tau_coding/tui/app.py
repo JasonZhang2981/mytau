@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Seque
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import datetime
+from enum import Enum, auto
 from inspect import isawaitable
 from io import StringIO
 from pathlib import Path
@@ -1312,11 +1313,18 @@ class LoginProviderSearchInput(Input):
         self._picker().action_cancel()
 
 
-class LoginProviderPickerScreen(ModalScreen[str | None]):
+class _LoginFlowAction(Enum):
+    """Navigation actions returned by nested login screens."""
+
+    BACK = auto()
+
+
+class LoginProviderPickerScreen(ModalScreen[str | _LoginFlowAction | None]):
     """Searchable provider picker for the TUI login flow."""
 
     BINDINGS: ClassVar[list[BindingEntry]] = [
         Binding("escape", "cancel", "Cancel"),
+        Binding("ctrl+d", "close", "Close", priority=True),
         Binding("up", "cursor_up", "Up", show=False),
         Binding("down", "cursor_down", "Down", show=False),
         Binding("enter", "select_cursor", "Select", show=False),
@@ -1328,9 +1336,11 @@ class LoginProviderPickerScreen(ModalScreen[str | None]):
         *,
         theme: TuiTheme,
         title: str = "Login",
+        back_on_cancel: bool = False,
     ) -> None:
         super().__init__()
         self.providers = tuple(providers)
+        self.back_on_cancel = back_on_cancel
         self.visible_providers = self.providers
         self.theme = theme
         self.title_text = title
@@ -1402,7 +1412,11 @@ class LoginProviderPickerScreen(ModalScreen[str | None]):
         self._select_visible_provider()
 
     def action_cancel(self) -> None:
-        """Close without selecting a provider."""
+        """Go back in a login flow, or close a standalone provider picker."""
+        self.dismiss(_LoginFlowAction.BACK if self.back_on_cancel else None)
+
+    def action_close(self) -> None:
+        """Close the entire login flow."""
         self.dismiss(None)
 
     def _select_visible_provider(self) -> None:
@@ -1448,6 +1462,7 @@ class LoginMethodPickerScreen(ModalScreen[str | None]):
 
     BINDINGS: ClassVar[list[BindingEntry]] = [
         Binding("escape", "cancel", "Cancel", priority=True),
+        Binding("ctrl+d", "cancel", "Close", priority=True),
         Binding("up", "cursor_up", "Up", show=False, priority=True),
         Binding("down", "cursor_down", "Down", show=False, priority=True),
         Binding("enter", "select_cursor", "Select", show=False, priority=True),
@@ -1477,7 +1492,7 @@ class LoginMethodPickerScreen(ModalScreen[str | None]):
                 ),
                 id="login-method-list",
             )
-            yield Static("Enter selects - Escape closes", id="login-method-help")
+            yield Static("Enter selects - Escape/Ctrl+D closes", id="login-method-help")
 
     def on_mount(self) -> None:
         """Focus the default subscription method."""
@@ -1902,11 +1917,14 @@ class ModelPickerScreen(ModalScreen[ModelChoice | None]):
         self.query_one("#model-picker-help", Static).update(help_text)
 
 
-class CustomProviderLoginScreen(ModalScreen[CustomProviderLoginResult | None]):
+class CustomProviderLoginScreen(
+    ModalScreen[CustomProviderLoginResult | _LoginFlowAction | None]
+):
     """Prompt for adding an OpenAI-compatible custom provider."""
 
     BINDINGS: ClassVar[list[BindingEntry]] = [
-        Binding("escape", "cancel", "Cancel"),
+        Binding("escape", "back", "Back"),
+        Binding("ctrl+d", "close", "Close", priority=True),
     ]
 
     _INPUT_ORDER: ClassVar[tuple[str, ...]] = (
@@ -1957,7 +1975,10 @@ class CustomProviderLoginScreen(ModalScreen[CustomProviderLoginResult | None]):
                 password=True,
                 id="custom-provider-api-key",
             )
-            yield Static("Enter advances/saves - Escape closes", id="login-footer")
+            yield Static(
+                "Enter advances/saves - Escape goes back - Ctrl+D closes",
+                id="login-footer",
+            )
 
     def on_mount(self) -> None:
         """Focus the first provider-detail field."""
@@ -2033,16 +2054,21 @@ class CustomProviderLoginScreen(ModalScreen[CustomProviderLoginResult | None]):
         self.query_one(f"#{input_id}", Input).focus()
         return None
 
-    def action_cancel(self) -> None:
-        """Close without adding a provider."""
+    def action_back(self) -> None:
+        """Return to the login method picker."""
+        self.dismiss(_LoginFlowAction.BACK)
+
+    def action_close(self) -> None:
+        """Close the entire login flow."""
         self.dismiss(None)
 
 
-class LoginScreen(ModalScreen[str | None]):
+class LoginScreen(ModalScreen[str | _LoginFlowAction | None]):
     """Password prompt for saving a provider API key."""
 
     BINDINGS: ClassVar[list[BindingEntry]] = [
-        Binding("escape", "cancel", "Cancel"),
+        Binding("escape", "back", "Back"),
+        Binding("ctrl+d", "close", "Close", priority=True),
     ]
 
     def __init__(self, provider: ProviderCatalogEntry, *, theme: TuiTheme) -> None:
@@ -2056,7 +2082,7 @@ class LoginScreen(ModalScreen[str | None]):
             yield Static(f"Login: {self.provider.display_name}", id="login-title")
             yield Static("Paste this provider's API key.", id="login-help")
             yield Input(placeholder="Paste API key", password=True, id="login-api-key")
-            yield Static("Enter saves - Escape closes", id="login-footer")
+            yield Static("Enter saves - Escape goes back - Ctrl+D closes", id="login-footer")
 
     def on_mount(self) -> None:
         """Focus the API key field."""
@@ -2069,16 +2095,21 @@ class LoginScreen(ModalScreen[str | None]):
         event.stop()
         self.dismiss(event.value.strip() or None)
 
-    def action_cancel(self) -> None:
-        """Close without saving."""
+    def action_back(self) -> None:
+        """Return to the login method picker without saving."""
+        self.dismiss(_LoginFlowAction.BACK)
+
+    def action_close(self) -> None:
+        """Close the entire login flow."""
         self.dismiss(None)
 
 
-class OAuthLoginScreen(ModalScreen[OAuthCredential | None]):
+class OAuthLoginScreen(ModalScreen[OAuthCredential | _LoginFlowAction | None]):
     """OAuth login flow for providers backed by subscription auth."""
 
     BINDINGS: ClassVar[list[BindingEntry]] = [
-        Binding("escape", "cancel", "Cancel"),
+        Binding("escape", "back", "Back"),
+        Binding("ctrl+d", "close", "Close", priority=True),
     ]
 
     def __init__(
@@ -2106,7 +2137,7 @@ class OAuthLoginScreen(ModalScreen[OAuthCredential | None]):
                 placeholder="Paste redirect URL or authorization code",
                 id="login-oauth-code",
             )
-            yield Static("Enter submits - Escape closes", id="login-footer")
+            yield Static("Enter submits - Escape goes back - Ctrl+D closes", id="login-footer")
 
     def on_mount(self) -> None:
         """Focus the manual-code field and start OAuth."""
@@ -2182,11 +2213,19 @@ class OAuthLoginScreen(ModalScreen[OAuthCredential | None]):
         if self._manual_code_future is not None and not self._manual_code_future.done():
             self._manual_code_future.set_result(value)
 
-    def action_cancel(self) -> None:
-        """Close without saving OAuth credentials."""
+    def action_back(self) -> None:
+        """Return to the login method picker without saving credentials."""
+        self._cancel_manual_code_input()
+        self.dismiss(_LoginFlowAction.BACK)
+
+    def action_close(self) -> None:
+        """Close the entire login flow without saving credentials."""
+        self._cancel_manual_code_input()
+        self.dismiss(None)
+
+    def _cancel_manual_code_input(self) -> None:
         if self._manual_code_future is not None and not self._manual_code_future.done():
             self._manual_code_future.cancel()
-        self.dismiss(None)
 
 
 #: Keys an extension key interceptor is never consulted for. These flow
@@ -4278,6 +4317,7 @@ class TauTuiApp(App[None]):
             LoginProviderPickerScreen(
                 providers,
                 theme=self.tui_settings.resolved_theme,
+                back_on_cancel=True,
             ),
             callback=lambda provider_name: self._handle_login_provider_result(
                 provider_name,
@@ -4287,13 +4327,14 @@ class TauTuiApp(App[None]):
 
     def _handle_login_provider_result(
         self,
-        provider_name: str | None,
+        provider_name: str | _LoginFlowAction | None,
         *,
         method: str | None = None,
     ) -> None:
-        if provider_name is None:
-            return
-        self._open_login(provider_name, method=method)
+        if provider_name is _LoginFlowAction.BACK:
+            self._open_login_picker()
+        elif provider_name is not None:
+            self._open_login(provider_name, method=method)
 
     def _open_custom_provider_login(self) -> None:
         self.push_screen(
@@ -4303,8 +4344,11 @@ class TauTuiApp(App[None]):
 
     def _handle_custom_provider_login_result(
         self,
-        result: CustomProviderLoginResult | None,
+        result: CustomProviderLoginResult | _LoginFlowAction | None,
     ) -> None:
+        if result is _LoginFlowAction.BACK:
+            self._open_login_picker()
+            return
         if result is None:
             return
         provider = OpenAICompatibleProviderConfig(
@@ -4369,13 +4413,27 @@ class TauTuiApp(App[None]):
                     theme=self.tui_settings.resolved_theme,
                     login=login,
                 ),
-                callback=lambda credential: self._handle_oauth_login_result(entry, credential),
+                callback=lambda credential: self._handle_oauth_login_navigation_result(
+                    entry, credential
+                ),
             )
             return
         self.push_screen(
             LoginScreen(entry, theme=self.tui_settings.resolved_theme),
-            callback=lambda api_key: self._handle_login_result(entry, api_key),
+            callback=lambda api_key: self._handle_api_key_login_navigation_result(
+                entry, api_key
+            ),
         )
+
+    def _handle_api_key_login_navigation_result(
+        self,
+        entry: ProviderCatalogEntry,
+        result: str | _LoginFlowAction | None,
+    ) -> None:
+        if result is _LoginFlowAction.BACK:
+            self._open_login_picker()
+        else:
+            self._handle_login_result(entry, result)
 
     def _handle_login_result(self, entry: ProviderCatalogEntry, api_key: str | None) -> None:
         if api_key is None:
@@ -4400,6 +4458,16 @@ class TauTuiApp(App[None]):
             return
         self._notify(f"Saved login for {entry.display_name}.")
         self._refresh()
+
+    def _handle_oauth_login_navigation_result(
+        self,
+        entry: ProviderCatalogEntry,
+        result: OAuthCredential | _LoginFlowAction | None,
+    ) -> None:
+        if result is _LoginFlowAction.BACK:
+            self._open_login_picker()
+        else:
+            self._handle_oauth_login_result(entry, result)
 
     def _handle_oauth_login_result(
         self,
@@ -4443,10 +4511,11 @@ class TauTuiApp(App[None]):
             callback=self._handle_logout_provider_result,
         )
 
-    def _handle_logout_provider_result(self, provider_name: str | None) -> None:
-        if provider_name is None:
-            return
-        self._logout(provider_name)
+    def _handle_logout_provider_result(
+        self, provider_name: str | _LoginFlowAction | None
+    ) -> None:
+        if isinstance(provider_name, str):
+            self._logout(provider_name)
 
     def _logout(self, provider_name: str) -> None:
         entry = builtin_provider_entry(provider_name)
