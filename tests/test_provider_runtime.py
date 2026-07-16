@@ -1,9 +1,15 @@
 import pytest
 
-from tau_ai import OpenAICodexProvider
+from tau_ai import AnthropicProvider, OpenAICodexProvider, OpenAICompatibleProvider
 from tau_coding import provider_runtime
 from tau_coding.credentials import FileCredentialStore, OAuthCredential
-from tau_coding.provider_config import OpenAICodexProviderConfig
+from tau_coding.provider_config import (
+    AnthropicProviderConfig,
+    OpenAICodexProviderConfig,
+    OpenAICompatibleProviderConfig,
+    ProviderConfigError,
+    provider_config_from_catalog_entry,
+)
 from tau_coding.provider_runtime import OpenAICodexCredentialResolver, create_model_provider
 
 
@@ -16,6 +22,62 @@ def test_create_model_provider_returns_openai_codex_provider(tmp_path) -> None:
     )
 
     assert isinstance(provider, OpenAICodexProvider)
+
+
+def test_create_model_provider_uses_anthropic_oauth_runtime_auth(tmp_path) -> None:
+    store = FileCredentialStore(tmp_path / "credentials.json")
+    store.set_oauth(
+        "anthropic",
+        OAuthCredential(
+            access="anthropic-oauth-access",
+            refresh="anthropic-refresh",
+            expires=9999999999999,
+        ),
+    )
+
+    provider = create_model_provider(AnthropicProviderConfig(), credential_store=store)
+
+    assert isinstance(provider, AnthropicProvider)
+    assert provider._config.bearer_auth is True
+    assert provider._config.credential_resolver is not None
+    assert provider._config.oauth_system_prompt is not None
+    assert provider._config.headers is not None
+    assert provider._config.headers["Authorization"] == "Bearer anthropic-oauth-access"
+
+
+def test_create_model_provider_uses_copilot_token_base_url(tmp_path) -> None:
+    store = FileCredentialStore(tmp_path / "credentials.json")
+    store.set_oauth(
+        "github-copilot",
+        OAuthCredential(
+            access="tid=1;proxy-ep=proxy.business.githubcopilot.com",
+            refresh="github-token",
+            expires=9999999999999,
+        ),
+    )
+    provider = create_model_provider(
+        provider_config_from_catalog_entry("github-copilot"),
+        credential_store=store,
+    )
+
+    assert isinstance(provider, OpenAICompatibleProvider)
+    assert provider._config.base_url == "https://api.business.githubcopilot.com"
+    assert provider._config.credential_resolver is not None
+
+
+def test_create_model_provider_rejects_model_not_declared_for_provider(tmp_path) -> None:
+    store = FileCredentialStore(tmp_path / "credentials.json")
+    provider_config = OpenAICompatibleProviderConfig(
+        name="local",
+        models=("qwen",),
+        default_model="qwen",
+    )
+
+    with pytest.raises(
+        ProviderConfigError,
+        match="Model is not configured for provider local: llama",
+    ):
+        create_model_provider(provider_config, credential_store=store, model="llama")
 
 
 def test_create_model_provider_maps_codex_reasoning_effort_like_pi(tmp_path) -> None:

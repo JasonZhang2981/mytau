@@ -1,5 +1,7 @@
 """Reload summary types for Tau coding-session resources."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 
@@ -24,5 +26,6 @@ class CodingReloadSummary:
     skills: ReloadCategorySummary
     prompt_templates: ReloadCategorySummary
     context_files: ReloadCategorySummary
+    extensions: ReloadCategorySummary
     diagnostics: ReloadCategorySummary
     system_prompt_rebuilt: bool

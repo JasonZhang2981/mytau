@@ -1,5 +1,7 @@
 """Stateful reusable agent harness built on the pure loop."""
 
+from __future__ import annotations
+
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import suppress
@@ -11,6 +13,7 @@ from tau_agent.events import AgentEvent, MessageEndEvent, MessageStartEvent, Que
 from tau_agent.loop import run_agent_loop
 from tau_agent.messages import AgentMessage, AssistantMessage, ToolResultMessage, UserMessage
 from tau_agent.tools import AgentTool
+from tau_agent.types import JSONValue
 from tau_ai.provider import ModelProvider
 
 EventListener = Callable[[AgentEvent], Awaitable[None] | None]
@@ -165,6 +168,12 @@ class AgentHarness:
             return None
         return self._follow_up_queue.pop()
 
+    def pop_latest_steering(self) -> AgentMessage | None:
+        """Remove and return the most recently queued steering message."""
+        if not self._steering_queue:
+            return None
+        return self._steering_queue.pop()
+
     def queue_update_event(self) -> QueueUpdateEvent:
         """Return the current queue state as a portable agent event."""
         return QueueUpdateEvent(
@@ -172,12 +181,23 @@ class AgentHarness:
             follow_up=tuple(message.content for message in self._follow_up_queue),
         )
 
-    def prompt(self, content: str) -> AsyncIterator[AgentEvent]:
-        """Append a user message and run the agent loop."""
+    def prompt(
+        self,
+        content: str,
+        *,
+        custom_type: str | None = None,
+        details: dict[str, JSONValue] | None = None,
+    ) -> AsyncIterator[AgentEvent]:
+        """Append a user message and run the agent loop.
+
+        ``custom_type``/``details`` ride along as presentation metadata on the
+        appended ``UserMessage`` (see ``send_custom_message``); they do not
+        change how the model reads ``content``.
+        """
         self._ensure_not_running()
         self._append_interrupted_tool_results()
         self._running = True
-        message = UserMessage(content=content)
+        message = UserMessage(content=content, custom_type=custom_type, details=details)
         self._messages.append(message)
         return self._run(prompt_message=message)
 
@@ -248,50 +268,43 @@ class AgentHarness:
             return messages
         return (queue.popleft(),)
 
+    def append_interrupted_tool_results(self) -> int:
+        """Repair a transcript left mid-tool-call by an interrupted run.
+
+        Returns the number of synthetic tool results that were appended.
+        """
+        before_count = len(self._messages)
+        self._append_interrupted_tool_results()
+        return len(self._messages) - before_count
+
     def _append_interrupted_tool_results(self) -> None:
         """Repair a transcript left mid-tool-call by an interrupted run.
 
         OpenAI-compatible providers reject a transcript where an assistant tool
-        call is not followed by a matching tool result. If the UI cancels the
-        worker while a tool is still running, the normal loop may not get a
-        chance to append the cancellation result, so repair that gap before the
-        next model request.
+        call has no matching tool result anywhere in the submitted history. If
+        the UI cancels the worker while a tool is still running, the normal loop
+        may not get a chance to append the cancellation result, so repair that
+        gap before the next model request.
         """
-        assistant_index = _latest_open_tool_call_assistant_index(self._messages)
-        if assistant_index is None:
-            return
-
-        assistant = self._messages[assistant_index]
-        if not isinstance(assistant, AssistantMessage):
-            return
-
         returned_ids = {
             message.tool_call_id
-            for message in self._messages[assistant_index + 1 :]
+            for message in self._messages
             if isinstance(message, ToolResultMessage)
         }
-        for tool_call in assistant.tool_calls:
-            if tool_call.id in returned_ids:
+        for message in tuple(self._messages):
+            if not isinstance(message, AssistantMessage):
                 continue
-            message = "Tool call interrupted by user"
-            self._messages.append(
-                ToolResultMessage(
-                    tool_call_id=tool_call.id,
-                    name=tool_call.name,
-                    content=message,
-                    ok=False,
-                    error=message,
+            for tool_call in message.tool_calls:
+                if tool_call.id in returned_ids:
+                    continue
+                returned_ids.add(tool_call.id)
+                content = "Tool call interrupted by user"
+                self._messages.append(
+                    ToolResultMessage(
+                        tool_call_id=tool_call.id,
+                        name=tool_call.name,
+                        content=content,
+                        ok=False,
+                        error=content,
+                    )
                 )
-            )
-
-
-def _latest_open_tool_call_assistant_index(messages: Sequence[AgentMessage]) -> int | None:
-    for index in range(len(messages) - 1, -1, -1):
-        message = messages[index]
-        if isinstance(message, UserMessage):
-            return None
-        if isinstance(message, AssistantMessage):
-            if message.tool_calls:
-                return index
-            return None
-    return None

@@ -1,25 +1,31 @@
 """Minimal Textual app for Tau coding sessions."""
 
+from __future__ import annotations
+
 import asyncio
-from collections.abc import AsyncIterator, Callable, Sequence
+import traceback
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Sequence
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
+from enum import Enum, auto
 from inspect import isawaitable
 from io import StringIO
 from pathlib import Path
-from typing import Any, ClassVar, Literal, Protocol, cast
+from typing import Any, ClassVar, Literal, Protocol, TypeVar, cast
 
 from rich.console import Console, Group
 from rich.text import Text
 from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingsMap
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.events import Key, Resize
 from textual.screen import ModalScreen
+from textual.theme import Theme
 from textual.timer import Timer
+from textual.widget import Widget
 from textual.widgets import (
     Button,
     Footer,
@@ -50,27 +56,54 @@ from tau_agent import (
 )
 from tau_agent.messages import AgentMessage, UserMessage
 from tau_agent.tools import AgentTool
+from tau_agent.types import JSONValue
 from tau_ai import ProviderErrorEvent, ProviderEvent
 from tau_ai.provider import CancellationToken
-from tau_coding.commands import CommandRegistry, create_default_command_registry
+from tau_coding.catalog_loader import save_user_catalog_entries
+from tau_coding.commands import (
+    LOGIN_PROVIDER_ALIASES,
+    CommandRegistry,
+    create_default_command_registry,
+    format_reload_summary,
+)
 from tau_coding.credentials import FileCredentialStore, OAuthCredential
-from tau_coding.oauth import OAuthAuthInfo, OAuthPrompt, login_openai_codex
+from tau_coding.extensions.api import (
+    KeyInterceptor,
+    MainViewFactory,
+    MainViewHandle,
+    Placement,
+    SlotWidgetContent,
+    SlotWidgetFactory,
+)
+from tau_coding.oauth import login_openai_codex
+from tau_coding.oauth_registry import get_oauth_provider, oauth_provider_ids
+from tau_coding.oauth_types import (
+    OAuthAuthInfo,
+    OAuthDeviceCodeInfo,
+    OAuthLoginCallbacks,
+    OAuthPrompt,
+    OAuthSelectPrompt,
+)
 from tau_coding.provider_catalog import (
     BUILTIN_PROVIDER_CATALOG,
     ProviderCatalogEntry,
     builtin_provider_entry,
 )
 from tau_coding.provider_config import (
+    OpenAICompatibleProviderConfig,
     ProviderConfig,
     ProviderSelection,
     load_provider_settings,
     provider_config_from_catalog_entry,
     provider_has_usable_credentials,
     resolve_provider_selection,
+    save_provider_settings,
+    upsert_openai_compatible_provider,
     upsert_saved_provider,
 )
 from tau_coding.provider_runtime import create_model_provider
 from tau_coding.session import (
+    TREE_RUNNING_MESSAGE,
     CodingSession,
     CodingSessionConfig,
     ModelChoice,
@@ -99,11 +132,17 @@ from tau_coding.tui.config import (
     load_tui_settings,
     save_tui_settings,
 )
-from tau_coding.tui.state import TuiState, format_terminal_command_result_block
+from tau_coding.tui.state import (
+    TOOL_SPINNER_FRAMES,
+    TuiState,
+    format_terminal_command_result_block,
+)
+from tau_coding.tui.terminal_title import TerminalTitleController
 from tau_coding.tui.widgets import (
     CompactSessionInfo,
     SessionSidebar,
     TranscriptView,
+    _custom_markup_to_text,
     render_completion_suggestions,
 )
 
@@ -114,6 +153,10 @@ ACTIVITY_TICK_SECONDS = 0.15
 ACTIVITY_COLOR_FADE_STEPS = 24
 ACTIVITY_INDICATOR_HEIGHT = 3
 COMPLETION_MAX_VISIBLE_LINES = 16
+COMPLETION_INITIAL_TERMINAL_FRACTION = 3
+COMPLETION_MIN_TRANSCRIPT_LINES = 4
+COMPLETION_WIDGET_CHROME_LINES = 3
+PROMPT_PLACEHOLDER = "Ask Tau…  Enter submits, Shift+Enter inserts a newline"
 NO_STORED_CREDENTIALS_MESSAGE = (
     "No stored credentials to remove. /logout only removes credentials saved by /login; "
     "environment variables and providers.json config are unchanged."
@@ -147,6 +190,222 @@ class LoginRequiredProvider:
         return iterator()
 
 
+_DialogResult = TypeVar("_DialogResult")
+
+
+class _TuiExtensionUiBridge:
+    """Route extension UI requests to the running Textual app."""
+
+    _SEVERITIES: ClassVar[dict[str, Literal["information", "warning", "error"]]] = {
+        "info": "information",
+        "warning": "warning",
+        "error": "error",
+    }
+
+    def __init__(self, app: TauTuiApp) -> None:
+        self._app = app
+
+    @property
+    def has_ui(self) -> bool:
+        """Return True: an interactive TUI is attached."""
+        return True
+
+    def notify(self, message: str, level: str = "info") -> None:
+        """Show an extension notification through the app's dedupe path."""
+        self._app._notify(message, severity=self._SEVERITIES.get(level, "information"))
+
+    async def select(
+        self,
+        title: str,
+        options: Sequence[str],
+        *,
+        timeout: float | None = None,
+    ) -> str | None:
+        """Show a modal picker; return the choice, or None on cancel/timeout."""
+        theme = self._app.tui_settings.resolved_theme
+        screen: ModalScreen[str | None] = ExtensionSelectScreen(title, options, theme=theme)
+        return await self._run_dialog(screen, default=None, timeout=timeout)
+
+    async def confirm(
+        self,
+        title: str,
+        message: str,
+        *,
+        timeout: float | None = None,
+    ) -> bool:
+        """Show a modal confirmation; True only if confirmed."""
+        theme = self._app.tui_settings.resolved_theme
+        screen: ModalScreen[bool] = ExtensionConfirmScreen(title, message, theme=theme)
+        return await self._run_dialog(screen, default=False, timeout=timeout)
+
+    async def input(
+        self,
+        title: str,
+        placeholder: str = "",
+        *,
+        timeout: float | None = None,
+    ) -> str | None:
+        """Show a modal text prompt; return the text, or None on cancel/timeout."""
+        theme = self._app.tui_settings.resolved_theme
+        screen: ModalScreen[str | None] = ExtensionInputScreen(title, placeholder, theme=theme)
+        return await self._run_dialog(screen, default=None, timeout=timeout)
+
+    # -- component seam -- pass-through to the app ----------------------------
+
+    @property
+    def supports_components(self) -> bool:
+        """Return True: a Textual TUI can host extension widgets."""
+        return True
+
+    @property
+    def theme(self) -> TuiTheme:
+        """Return the live TUI theme handed to widget factories."""
+        return self._app.tui_settings.resolved_theme
+
+    def get_prompt_text(self) -> str:
+        """Return the current prompt-editor text (Pi's getEditorText).
+
+        Interceptors do not need this — the host passes the prompt text as
+        their second argument; it exists for reads outside the key path.
+        """
+        return self._app._current_prompt_text()
+
+    def request_render(self) -> None:
+        """Re-render mounted extension widgets (analog of Pi's requestRender)."""
+        self._app._refresh_extension_components()
+
+    def set_slot_widget(
+        self,
+        key: str,
+        content: SlotWidgetContent | None,
+        *,
+        placement: Placement = "above_prompt",
+    ) -> None:
+        """Mount or remove an extension slot widget by key (factory or lines)."""
+        self._app._set_extension_slot_widget(key, content, placement)
+
+    def open_main_view(self, factory: MainViewFactory) -> MainViewHandle:
+        """Open a full main-area extension view (display-toggled, not modal)."""
+        return self._app._open_extension_main_view(factory)
+
+    def register_key_interceptor(self, handler: KeyInterceptor) -> Callable[[], None]:
+        """Register a pre-dispatch key hook; return an unsubscribe callable.
+
+        Ports Pi's ``onTerminalInput``. The handler is consulted in
+        ``TauTuiApp.on_event`` before Textual's app-level priority bindings and
+        before the focused widget receives the key, so it can own navigation
+        keys (``up``/``down``/``tab``/…) that tau otherwise binds with
+        ``priority=True``. Because it fires for EVERY main-screen key regardless
+        of which widget holds focus, the handler MUST self-gate (e.g. on the
+        prompt text and its own state) and return ``True`` only for keys it
+        actually consumes. It is never consulted while a modal screen (dialog,
+        picker, command palette) is on top.
+        """
+        return self._app._register_extension_key_interceptor(handler)
+
+    def clear_components(self) -> None:
+        """Tear down all extension-owned UI (runtime-driven: /reload, rebind)."""
+        self._app._clear_extension_components()
+
+    async def _run_dialog(
+        self,
+        screen: ModalScreen[_DialogResult],
+        *,
+        default: _DialogResult,
+        timeout: float | None,
+    ) -> _DialogResult:
+        """Push a modal and await its dismissal via a callback-resolved future.
+
+        Uses ``push_screen(screen, callback)`` + an ``asyncio.Future`` rather
+        than ``push_screen_wait`` (which requires a Textual worker context);
+        this pattern works from any coroutine on the app's event loop,
+        including a task spawned by a sync ``/command`` handler. On ``timeout``
+        (seconds) the dialog auto-dismisses and the no-op ``default`` returns.
+        """
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[_DialogResult] = loop.create_future()
+
+        def _resolve(result: _DialogResult | None) -> None:
+            # Textual passes None when a screen is dismissed with no value;
+            # map that (and any explicit cancel) to the no-op default.
+            if not future.done():
+                future.set_result(default if result is None else result)
+
+        self._app.push_screen(screen, _resolve)
+        if timeout is None:
+            return await future
+        try:
+            return await asyncio.wait_for(future, timeout)
+        except TimeoutError:
+            # `Screen.dismiss` only works while the dialog is the top screen.
+            # Known limitation: if another screen was pushed on top before the
+            # timeout fired, the stale dialog stays on the stack (its future
+            # result is discarded by `_resolve` racing `future.done()`) until
+            # the covering screen closes and the user dismisses it manually.
+            if screen.is_current:
+                with suppress(Exception):
+                    screen.dismiss(default)
+            return default
+
+
+class _MainViewHandle:
+    """Host-side handle to an open extension main view.
+
+    ``close(result)`` is idempotent and routes back to the app, which unmounts
+    the widget and restores the main transcript; it also resolves ``wait()``
+    with ``result`` (Pi's ``done(result)``). Every other teardown path the host
+    owns — session rebind, quarantine, being superseded by a later
+    ``open_main_view`` — resolves ``wait()`` with ``None`` via
+    :meth:`_resolve`, so an awaiting extension task never hangs.
+    """
+
+    def __init__(self, app: TauTuiApp, result: asyncio.Future[object | None]) -> None:
+        self._app = app
+        self._open = True
+        self.widget: Widget | None = None
+        # Created on the app's event loop at open time; resolved exactly once by
+        # the first teardown (close/clear/quarantine/supersede) to wake wait().
+        self._result = result
+
+    def close(self, result: object | None = None) -> None:
+        """Close the view, resolving ``wait()`` with ``result`` (safe to repeat)."""
+        if not self._open:
+            return
+        self._open = False
+        self._resolve(result)
+        self._app._close_extension_main_view(self)
+
+    def _resolve(self, result: object | None) -> None:
+        """Resolve the pending ``wait()`` future once; later calls are no-ops."""
+        if not self._result.done():
+            self._result.set_result(result)
+
+    async def wait(self) -> object | None:
+        """Await teardown and return the ``close`` result (``None`` if cleared)."""
+        return await self._result
+
+    @property
+    def is_open(self) -> bool:
+        """Return whether the view is still open."""
+        return self._open
+
+
+class _DeadMainViewHandle:
+    """A no-op main-view handle returned when a view could not be opened."""
+
+    def close(self, result: object | None = None) -> None:
+        """Do nothing: there is no view to close (``result`` is ignored)."""
+
+    async def wait(self) -> object | None:
+        """Return None immediately: a dead handle never opens a view."""
+        return None
+
+    @property
+    def is_open(self) -> bool:
+        """Return False: a dead handle is never open."""
+        return False
+
+
 class CompletionActionTarget(Protocol):
     """App actions used by the prompt input completion bindings."""
 
@@ -170,7 +429,7 @@ class CompletionActionTarget(Protocol):
 
     def action_toggle_thinking(self) -> None: ...
 
-    def action_edit_queued_follow_up(self) -> bool: ...
+    def action_edit_queued_message(self) -> bool: ...
 
     async def action_submit_prompt(self) -> None: ...
 
@@ -185,6 +444,9 @@ class SessionCompletionRecord(Protocol):
     model: str
     cwd: Path
     updated_at: float
+
+
+PASTE_DISPLAY_THRESHOLD = 2_000
 
 
 class PromptInput(TextArea):
@@ -204,6 +466,8 @@ class PromptInput(TextArea):
         self.tui_keybindings = tui_keybindings or TuiKeybindings()
         self._base_bindings = self._bindings.copy()
         self._footer_mode: Literal["normal", "completion", "running"] = "normal"
+        self._pending_pastes: list[tuple[str, str]] = []
+        self._paste_placeholder_counter = 0
         self._apply_prompt_bindings()
 
     def set_footer_mode(self, mode: Literal["normal", "completion", "running"]) -> None:
@@ -260,7 +524,7 @@ class PromptInput(TextArea):
         """Select the previous app-level completion or move up in the prompt."""
         if self._has_completion_options():
             self._completion_target().action_completion_previous()
-        elif self._completion_target().action_edit_queued_follow_up():
+        elif self._completion_target().action_edit_queued_message():
             return
         else:
             self.action_cursor_up()
@@ -300,6 +564,7 @@ class PromptInput(TextArea):
         if self.text:
             self.text = ""
             self.move_cursor((0, 0))
+            self._clear_pending_paste()
 
     def get_line(self, line_index: int) -> Text:
         """Retrieve one prompt line with shell prefixes highlighted."""
@@ -337,8 +602,60 @@ class PromptInput(TextArea):
         """Use up arrow for completion selection while focused."""
         self.action_completion_previous()
 
+    def on_paste(self, event: events.Paste) -> None:
+        """Show a compact placeholder instead of rendering very large pasted text."""
+        if len(event.text) <= PASTE_DISPLAY_THRESHOLD:
+            return
+        event.stop()
+        event.prevent_default()
+        self._show_large_paste_placeholder(event.text)
+
+    def _show_large_paste_placeholder(self, content: str) -> None:
+        """Store large pasted text and render a compact placeholder."""
+        self._paste_placeholder_counter += 1
+        placeholder = self._large_paste_placeholder(content, self._paste_placeholder_counter)
+        self._pending_pastes.append((placeholder, content))
+        self.insert(placeholder)
+
+    def _large_paste_placeholder(self, content: str, paste_number: int) -> str:
+        """Build the display text for a large paste."""
+        char_count = len(content)
+        line_count = content.count("\n") + 1
+        kb = char_count / 1024
+        parts: list[str] = [f"{char_count:,} characters"]
+        if line_count > 1:
+            parts.append(f"{line_count} lines")
+        if kb >= 1:
+            parts.append(f"{kb:.1f} KB")
+        return f"[Pasted content #{paste_number}: {', '.join(parts)}]"
+
+    def _clear_pending_paste(self) -> None:
+        """Forget any stored large paste content."""
+        self._pending_pastes.clear()
+
+    def sync_pending_paste(self) -> None:
+        """Invalidate stored paste content when its placeholder is edited away."""
+        self._pending_pastes = [
+            (placeholder, content)
+            for placeholder, content in self._pending_pastes
+            if placeholder in self.text
+        ]
+
+    def text_for_submission(self) -> str:
+        """Return the prompt text, expanding intact large-paste placeholders."""
+        self.sync_pending_paste()
+        text = self.text
+        for placeholder, content in self._pending_pastes:
+            text = text.replace(placeholder, content, 1)
+        return text
+
     async def on_key(self, event: Key) -> None:
-        """Route completion and submission keys before default input handling."""
+        """Route completion and submission keys before default input handling.
+
+        Extension key interceptors are consulted upstream in
+        :meth:`TauTuiApp.on_event` (pre-dispatch, before app-level priority
+        bindings), so there is no interceptor splice here.
+        """
         keybindings = self.tui_keybindings
         if event.key == keybindings.queue_follow_up:
             event.stop()
@@ -403,6 +720,189 @@ class PromptInput(TextArea):
 
     def _completion_target(self) -> CompletionActionTarget:
         return cast(CompletionActionTarget, self.app)
+
+
+class ExtensionSelectScreen(ModalScreen[str | None]):
+    """Modal option picker backing `context.ui.select`.
+
+    Binding/key wiring mirrors `SessionPickerScreen`. Note: the app binds
+    Up/Down globally with priority (completion navigation), so this screen
+    must also be listed in the `action_completion_next/previous` and
+    `action_accept_completion` screen allowlists for arrow keys to reach
+    the option list.
+    """
+
+    BINDINGS: ClassVar[list[BindingEntry]] = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("up", "cursor_up", "Up", show=False),
+        Binding("down", "cursor_down", "Down", show=False),
+        Binding("enter", "select_cursor", "Select", show=False),
+    ]
+
+    def __init__(
+        self,
+        title: str,
+        options: Sequence[str],
+        *,
+        theme: TuiTheme,
+    ) -> None:
+        super().__init__()
+        self.title_text = title
+        self.options = tuple(options)
+        self.theme = theme
+
+    def compose(self) -> ComposeResult:
+        """Compose the option picker."""
+        with Vertical(id="extension-select"):
+            yield Static(self.title_text, id="extension-select-title", markup=False)
+            yield ListView(
+                *[ListItem(Label(option, markup=False)) for option in self.options],
+                id="extension-select-list",
+            )
+            yield Static("Enter selects - Escape cancels", id="extension-select-help")
+
+    def on_mount(self) -> None:
+        """Focus the option list for keyboard navigation."""
+        option_list = self.query_one("#extension-select-list", ListView)
+        option_list.index = 0
+        option_list.focus()
+
+    def on_key(self, event: Key) -> None:
+        """Route arrow and enter keys to the option list."""
+        if event.key == "up":
+            event.stop()
+            self.action_cursor_up()
+        elif event.key == "down":
+            event.stop()
+            self.action_cursor_down()
+        elif event.key == "enter":
+            event.stop()
+            self.action_select_cursor()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        """Dismiss with the chosen option."""
+        self.dismiss(self.options[event.index])
+
+    def action_cursor_up(self) -> None:
+        """Move to the previous option."""
+        self.query_one("#extension-select-list", ListView).action_cursor_up()
+
+    def action_cursor_down(self) -> None:
+        """Move to the next option."""
+        self.query_one("#extension-select-list", ListView).action_cursor_down()
+
+    def action_select_cursor(self) -> None:
+        """Select the highlighted option."""
+        self.query_one("#extension-select-list", ListView).action_select_cursor()
+
+    def action_cancel(self) -> None:
+        """Close without choosing an option."""
+        self.dismiss(None)
+
+
+class ExtensionConfirmScreen(ModalScreen[bool]):
+    """Modal yes/no confirmation backing `context.ui.confirm`.
+
+    Binding/key wiring mirrors `SessionPickerScreen`; see
+    `ExtensionSelectScreen` for the app-level Up/Down allowlist requirement.
+    """
+
+    BINDINGS: ClassVar[list[BindingEntry]] = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("up", "cursor_up", "Up", show=False),
+        Binding("down", "cursor_down", "Down", show=False),
+        Binding("enter", "select_cursor", "Select", show=False),
+    ]
+
+    def __init__(self, title: str, message: str, *, theme: TuiTheme) -> None:
+        super().__init__()
+        self.title_text = title
+        self.message = message
+        self.theme = theme
+
+    def compose(self) -> ComposeResult:
+        """Compose the confirmation dialog."""
+        with Vertical(id="extension-confirm"):
+            yield Static(self.title_text, id="extension-confirm-title", markup=False)
+            yield Static(self.message, id="extension-confirm-message", markup=False)
+            yield ListView(
+                ListItem(Label("Yes", markup=False)),
+                ListItem(Label("No", markup=False)),
+                id="extension-confirm-list",
+            )
+            yield Static("Enter selects - Escape cancels", id="extension-confirm-help")
+
+    def on_mount(self) -> None:
+        """Focus the choice list."""
+        choice_list = self.query_one("#extension-confirm-list", ListView)
+        choice_list.index = 0
+        choice_list.focus()
+
+    def on_key(self, event: Key) -> None:
+        """Route arrow and enter keys to the choice list."""
+        if event.key == "up":
+            event.stop()
+            self.action_cursor_up()
+        elif event.key == "down":
+            event.stop()
+            self.action_cursor_down()
+        elif event.key == "enter":
+            event.stop()
+            self.action_select_cursor()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        """Dismiss with the confirmation result (Yes is index 0)."""
+        self.dismiss(event.index == 0)
+
+    def action_cursor_up(self) -> None:
+        """Move to the previous choice."""
+        self.query_one("#extension-confirm-list", ListView).action_cursor_up()
+
+    def action_cursor_down(self) -> None:
+        """Move to the next choice."""
+        self.query_one("#extension-confirm-list", ListView).action_cursor_down()
+
+    def action_select_cursor(self) -> None:
+        """Select the highlighted choice."""
+        self.query_one("#extension-confirm-list", ListView).action_select_cursor()
+
+    def action_cancel(self) -> None:
+        """Close, declining the confirmation."""
+        self.dismiss(False)
+
+
+class ExtensionInputScreen(ModalScreen[str | None]):
+    """Modal single-line text prompt backing `context.ui.input`."""
+
+    BINDINGS: ClassVar[list[BindingEntry]] = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, title: str, placeholder: str = "", *, theme: TuiTheme) -> None:
+        super().__init__()
+        self.title_text = title
+        self.placeholder = placeholder
+        self.theme = theme
+
+    def compose(self) -> ComposeResult:
+        """Compose the text prompt."""
+        with Vertical(id="extension-input"):
+            yield Static(self.title_text, id="extension-input-title", markup=False)
+            yield Input(placeholder=self.placeholder, id="extension-input-field")
+            yield Static("Enter submits - Escape cancels", id="extension-input-help")
+
+    def on_mount(self) -> None:
+        """Focus the text field."""
+        self.query_one("#extension-input-field", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Dismiss with the entered text."""
+        if event.input.id != "extension-input-field":
+            return
+        event.stop()
+        self.dismiss(event.value)
+
+    def action_cancel(self) -> None:
+        """Close without submitting text."""
+        self.dismiss(None)
 
 
 class SessionPickerScreen(ModalScreen[str | None]):
@@ -711,6 +1211,8 @@ class CommandOutputScroll(VerticalScroll):
 class CommandOutputScreen(ModalScreen[None]):
     """Dismissible modal for slash-command output."""
 
+    auto_copy_selection: bool = False
+
     BINDINGS: ClassVar[list[BindingEntry]] = [
         Binding("escape", "close", "Close"),
         Binding("enter", "close", "Close"),
@@ -718,11 +1220,19 @@ class CommandOutputScreen(ModalScreen[None]):
         Binding("down", "scroll_down", "Scroll down", show=False, priority=True),
     ]
 
-    def __init__(self, title: str, message: str, *, theme: TuiTheme) -> None:
+    def __init__(
+        self,
+        title: str,
+        message: str,
+        *,
+        theme: TuiTheme,
+        auto_copy_selection: bool = False,
+    ) -> None:
         super().__init__()
         self.title_text = title
         self.message = message
         self.theme = theme
+        self.auto_copy_selection = auto_copy_selection
 
     def compose(self) -> ComposeResult:
         """Compose command output."""
@@ -730,7 +1240,7 @@ class CommandOutputScreen(ModalScreen[None]):
             yield Static(self.title_text, id="command-output-title")
             with CommandOutputScroll(id="command-output-scroll"):
                 yield Static(self.message, id="command-output-body", markup=False)
-            yield Static("Enter or Escape closes", id="command-output-help")
+            yield Static(self._help_text(), id="command-output-help")
 
     def on_mount(self) -> None:
         """Focus the scroll area so arrow keys navigate long output."""
@@ -749,6 +1259,11 @@ class CommandOutputScreen(ModalScreen[None]):
         """Close the command output modal."""
         self.dismiss(None)
 
+    def _help_text(self) -> str:
+        if self.auto_copy_selection:
+            return "Select text to copy - Enter or Escape closes"
+        return "Enter or Escape closes"
+
     def action_scroll_up(self) -> None:
         """Scroll command output up."""
         self.query_one("#command-output-scroll", CommandOutputScroll).action_scroll_up()
@@ -758,11 +1273,58 @@ class CommandOutputScreen(ModalScreen[None]):
         self.query_one("#command-output-scroll", CommandOutputScroll).action_scroll_down()
 
 
-class LoginProviderPickerScreen(ModalScreen[str | None]):
-    """Provider picker for the TUI login flow."""
+class LoginProviderSearchInput(Input):
+    """Search input that keeps provider-picker navigation local."""
+
+    BINDINGS: ClassVar[list[BindingEntry]] = [
+        Binding("escape", "cancel", "Cancel", show=False, priority=True),
+        Binding("up", "cursor_up", "Up", show=False, priority=True),
+        Binding("down", "cursor_down", "Down", show=False, priority=True),
+    ]
+
+    def _picker(self) -> LoginProviderPickerScreen:
+        return cast(LoginProviderPickerScreen, self.screen)
+
+    def on_key(self, event: Key) -> None:
+        """Route picker control keys before the input edits its text."""
+        if event.key == "up":
+            event.stop()
+            event.prevent_default()
+            self.action_cursor_up()
+        elif event.key == "down":
+            event.stop()
+            event.prevent_default()
+            self.action_cursor_down()
+        elif event.key == "escape":
+            event.stop()
+            event.prevent_default()
+            self.action_cancel()
+
+    def action_cursor_up(self) -> None:
+        """Move the provider picker selection up."""
+        self._picker().action_cursor_up()
+
+    def action_cursor_down(self) -> None:
+        """Move the provider picker selection down."""
+        self._picker().action_cursor_down()
+
+    def action_cancel(self) -> None:
+        """Close the provider picker."""
+        self._picker().action_cancel()
+
+
+class _LoginFlowAction(Enum):
+    """Navigation actions returned by nested login screens."""
+
+    BACK = auto()
+
+
+class LoginProviderPickerScreen(ModalScreen[str | _LoginFlowAction | None]):
+    """Searchable provider picker for the TUI login flow."""
 
     BINDINGS: ClassVar[list[BindingEntry]] = [
         Binding("escape", "cancel", "Cancel"),
+        Binding("ctrl+d", "close", "Close", priority=True),
         Binding("up", "cursor_up", "Up", show=False),
         Binding("down", "cursor_down", "Down", show=False),
         Binding("enter", "select_cursor", "Select", show=False),
@@ -774,9 +1336,12 @@ class LoginProviderPickerScreen(ModalScreen[str | None]):
         *,
         theme: TuiTheme,
         title: str = "Login",
+        back_on_cancel: bool = False,
     ) -> None:
         super().__init__()
         self.providers = tuple(providers)
+        self.back_on_cancel = back_on_cancel
+        self.visible_providers = self.providers
         self.theme = theme
         self.title_text = title
 
@@ -784,6 +1349,10 @@ class LoginProviderPickerScreen(ModalScreen[str | None]):
         """Compose the provider picker."""
         with Vertical(id="login-provider-picker"):
             yield Static(self.title_text, id="login-provider-title")
+            yield LoginProviderSearchInput(
+                placeholder="Search providers",
+                id="login-provider-search",
+            )
             yield ListView(
                 *[
                     ListItem(Label(_login_provider_label(provider), markup=False))
@@ -794,10 +1363,24 @@ class LoginProviderPickerScreen(ModalScreen[str | None]):
             yield Static("Enter selects - Escape closes", id="login-provider-help")
 
     def on_mount(self) -> None:
-        """Focus the provider list."""
-        provider_list = self.query_one("#login-provider-list", ListView)
-        provider_list.index = 0
-        provider_list.focus()
+        """Focus the provider search field."""
+        self.query_one("#login-provider-search", Input).focus()
+        self._refresh_provider_list()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """Filter providers as the search value changes."""
+        if event.input.id != "login-provider-search":
+            return
+        event.stop()
+        self.visible_providers = _filter_login_providers(self.providers, event.value)
+        self._refresh_provider_list()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Select the highlighted provider from the search field."""
+        if event.input.id != "login-provider-search":
+            return
+        event.stop()
+        self._select_visible_provider()
 
     def on_key(self, event: Key) -> None:
         """Route provider picker keys to the list."""
@@ -813,7 +1396,8 @@ class LoginProviderPickerScreen(ModalScreen[str | None]):
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         """Dismiss with the selected provider name."""
-        self.dismiss(self.providers[event.index].name)
+        event.stop()
+        self._select_visible_provider()
 
     def action_cursor_up(self) -> None:
         """Move to the previous provider."""
@@ -825,11 +1409,52 @@ class LoginProviderPickerScreen(ModalScreen[str | None]):
 
     def action_select_cursor(self) -> None:
         """Select the highlighted provider."""
-        self.query_one("#login-provider-list", ListView).action_select_cursor()
+        self._select_visible_provider()
 
     def action_cancel(self) -> None:
-        """Close without selecting a provider."""
+        """Go back in a login flow, or close a standalone provider picker."""
+        self.dismiss(_LoginFlowAction.BACK if self.back_on_cancel else None)
+
+    def action_close(self) -> None:
+        """Close the entire login flow."""
         self.dismiss(None)
+
+    def _select_visible_provider(self) -> None:
+        provider_list = self.query_one("#login-provider-list", ListView)
+        index = provider_list.index
+        if index is None or not self.visible_providers:
+            return
+        self.dismiss(self.visible_providers[index].name)
+
+    def _refresh_provider_list(self) -> None:
+        provider_list = self.query_one("#login-provider-list", ListView)
+        provider_list.clear()
+        provider_list.extend(
+            [
+                ListItem(Label(_login_provider_label(provider), markup=False))
+                for provider in self.visible_providers
+            ]
+        )
+        provider_list.index = 0 if self.visible_providers else None
+        help_text = (
+            "Enter selects - Escape closes"
+            if self.visible_providers
+            else "No matching providers - Escape closes"
+        )
+        self.query_one("#login-provider-help", Static).update(help_text)
+
+
+@dataclass(frozen=True, slots=True)
+class CustomProviderLoginResult:
+    """Provider details collected by the custom-provider login flow."""
+
+    provider_name: str
+    display_name: str
+    base_url: str
+    api_key_env: str
+    models: tuple[str, ...]
+    default_model: str
+    api_key: str
 
 
 class LoginMethodPickerScreen(ModalScreen[str | None]):
@@ -837,6 +1462,7 @@ class LoginMethodPickerScreen(ModalScreen[str | None]):
 
     BINDINGS: ClassVar[list[BindingEntry]] = [
         Binding("escape", "cancel", "Cancel", priority=True),
+        Binding("ctrl+d", "cancel", "Close", priority=True),
         Binding("up", "cursor_up", "Up", show=False, priority=True),
         Binding("down", "cursor_down", "Down", show=False, priority=True),
         Binding("enter", "select_cursor", "Select", show=False, priority=True),
@@ -853,16 +1479,20 @@ class LoginMethodPickerScreen(ModalScreen[str | None]):
             yield Static("Choose how to authenticate.", id="login-method-intro")
             yield LoginMethodListView(
                 ListItem(
-                    Label("Subscription\n  Sign in with an OAuth account.", markup=False),
+                    Label("Subscription — OAuth account", markup=False),
                     id="login-method-subscription",
                 ),
                 ListItem(
-                    Label("API key\n  Save a provider API key.", markup=False),
+                    Label("API key — built-in provider", markup=False),
                     id="login-method-api-key",
+                ),
+                ListItem(
+                    Label("Custom provider — OpenAI-compatible", markup=False),
+                    id="login-method-custom",
                 ),
                 id="login-method-list",
             )
-            yield Static("Enter selects - Escape closes", id="login-method-help")
+            yield Static("Enter selects - Escape/Ctrl+D closes", id="login-method-help")
 
     def on_mount(self) -> None:
         """Focus the default subscription method."""
@@ -888,6 +1518,8 @@ class LoginMethodPickerScreen(ModalScreen[str | None]):
             self.dismiss("subscription")
         elif event.button.id == "login-method-api-key":
             self.dismiss("api-key")
+        elif event.button.id == "login-method-custom":
+            self.dismiss("custom")
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         """Dismiss with the selected login method."""
@@ -895,6 +1527,8 @@ class LoginMethodPickerScreen(ModalScreen[str | None]):
             self.dismiss("subscription")
         elif event.item.id == "login-method-api-key":
             self.dismiss("api-key")
+        elif event.item.id == "login-method-custom":
+            self.dismiss("custom")
 
     def action_cancel(self) -> None:
         """Close without selecting a login method."""
@@ -1283,11 +1917,156 @@ class ModelPickerScreen(ModalScreen[ModelChoice | None]):
         self.query_one("#model-picker-help", Static).update(help_text)
 
 
-class LoginScreen(ModalScreen[str | None]):
+class CustomProviderLoginScreen(ModalScreen[CustomProviderLoginResult | _LoginFlowAction | None]):
+    """Prompt for adding an OpenAI-compatible custom provider."""
+
+    BINDINGS: ClassVar[list[BindingEntry]] = [
+        Binding("escape", "back", "Back"),
+        Binding("ctrl+d", "close", "Close", priority=True),
+    ]
+
+    _INPUT_ORDER: ClassVar[tuple[str, ...]] = (
+        "custom-provider-name",
+        "custom-provider-display-name",
+        "custom-provider-base-url",
+        "custom-provider-api-key-env",
+        "custom-provider-models",
+        "custom-provider-default-model",
+        "custom-provider-api-key",
+    )
+
+    def __init__(self, *, theme: TuiTheme) -> None:
+        super().__init__()
+        self.theme = theme
+
+    def compose(self) -> ComposeResult:
+        """Compose the custom provider prompt."""
+        with Vertical(id="login-screen"):
+            yield Static("Add custom provider", id="login-title")
+            yield Static(
+                "Short provider name is used in commands/config.",
+                id="custom-provider-help",
+            )
+            yield Input(placeholder="Provider name/id, e.g. nebius", id="custom-provider-name")
+            yield Input(
+                placeholder="Display name shown in UI, e.g. Nebius AI Studio",
+                id="custom-provider-display-name",
+            )
+            yield Input(
+                placeholder="OpenAI-compatible base URL, e.g. https://api.studio.nebius.ai/v1",
+                id="custom-provider-base-url",
+            )
+            yield Input(
+                placeholder="API key environment variable fallback, e.g. NEBIUS_API_KEY",
+                id="custom-provider-api-key-env",
+            )
+            yield Input(
+                placeholder="Model ids, comma-separated, e.g. model-a, model-b",
+                id="custom-provider-models",
+            )
+            yield Input(
+                placeholder="Default model id, must be listed above",
+                id="custom-provider-default-model",
+            )
+            yield Input(
+                placeholder="Paste API key to save for this provider",
+                password=True,
+                id="custom-provider-api-key",
+            )
+            yield Static(
+                "Enter advances/saves - Escape goes back - Ctrl+D closes",
+                id="login-footer",
+            )
+
+    def on_mount(self) -> None:
+        """Focus the first provider-detail field."""
+        self.query_one("#custom-provider-name", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Advance through fields, then dismiss with provider details."""
+        input_id = event.input.id
+        if input_id not in self._INPUT_ORDER:
+            return
+        event.stop()
+        if input_id != self._INPUT_ORDER[-1]:
+            self._focus_next(input_id)
+            return
+        result = self._collect_result()
+        if result is not None:
+            self.dismiss(result)
+
+    def _focus_next(self, input_id: str) -> None:
+        index = self._INPUT_ORDER.index(input_id)
+        self.query_one(f"#{self._INPUT_ORDER[index + 1]}", Input).focus()
+
+    def _collect_result(self) -> CustomProviderLoginResult | None:
+        provider_name = self._field("custom-provider-name", "Provider name")
+        if provider_name is None:
+            return None
+        base_url = self._field("custom-provider-base-url", "Base URL")
+        if base_url is None:
+            return None
+        api_key_env = self._field("custom-provider-api-key-env", "API key environment variable")
+        if api_key_env is None:
+            return None
+        models_text = self._field("custom-provider-models", "Model ids")
+        if models_text is None:
+            return None
+        models = tuple(
+            dict.fromkeys(item.strip() for item in models_text.split(",") if item.strip())
+        )
+        if not models:
+            self.query_one("#custom-provider-help", Static).update(
+                "At least one model id is required."
+            )
+            self.query_one("#custom-provider-models", Input).focus()
+            return None
+        default_model = self._field("custom-provider-default-model", "Default model")
+        if default_model is None:
+            return None
+        if default_model not in models:
+            self.query_one("#custom-provider-help", Static).update(
+                "Default model must be included in the model list."
+            )
+            self.query_one("#custom-provider-default-model", Input).focus()
+            return None
+        api_key = self._field("custom-provider-api-key", "API key")
+        if api_key is None:
+            return None
+        display_name = self.query_one("#custom-provider-display-name", Input).value.strip()
+        return CustomProviderLoginResult(
+            provider_name=provider_name,
+            display_name=display_name or provider_name,
+            base_url=base_url,
+            api_key_env=api_key_env,
+            models=models,
+            default_model=default_model,
+            api_key=api_key,
+        )
+
+    def _field(self, input_id: str, label: str) -> str | None:
+        value = self.query_one(f"#{input_id}", Input).value.strip()
+        if value:
+            return value
+        self.query_one("#custom-provider-help", Static).update(f"{label} is required.")
+        self.query_one(f"#{input_id}", Input).focus()
+        return None
+
+    def action_back(self) -> None:
+        """Return to the login method picker."""
+        self.dismiss(_LoginFlowAction.BACK)
+
+    def action_close(self) -> None:
+        """Close the entire login flow."""
+        self.dismiss(None)
+
+
+class LoginScreen(ModalScreen[str | _LoginFlowAction | None]):
     """Password prompt for saving a provider API key."""
 
     BINDINGS: ClassVar[list[BindingEntry]] = [
-        Binding("escape", "cancel", "Cancel"),
+        Binding("escape", "back", "Back"),
+        Binding("ctrl+d", "close", "Close", priority=True),
     ]
 
     def __init__(self, provider: ProviderCatalogEntry, *, theme: TuiTheme) -> None:
@@ -1301,7 +2080,7 @@ class LoginScreen(ModalScreen[str | None]):
             yield Static(f"Login: {self.provider.display_name}", id="login-title")
             yield Static("Paste this provider's API key.", id="login-help")
             yield Input(placeholder="Paste API key", password=True, id="login-api-key")
-            yield Static("Enter saves - Escape closes", id="login-footer")
+            yield Static("Enter saves - Escape goes back - Ctrl+D closes", id="login-footer")
 
     def on_mount(self) -> None:
         """Focus the API key field."""
@@ -1314,36 +2093,49 @@ class LoginScreen(ModalScreen[str | None]):
         event.stop()
         self.dismiss(event.value.strip() or None)
 
-    def action_cancel(self) -> None:
-        """Close without saving."""
+    def action_back(self) -> None:
+        """Return to the login method picker without saving."""
+        self.dismiss(_LoginFlowAction.BACK)
+
+    def action_close(self) -> None:
+        """Close the entire login flow."""
         self.dismiss(None)
 
 
-class OAuthLoginScreen(ModalScreen[OAuthCredential | None]):
+class OAuthLoginScreen(ModalScreen[OAuthCredential | _LoginFlowAction | None]):
     """OAuth login flow for providers backed by subscription auth."""
 
     BINDINGS: ClassVar[list[BindingEntry]] = [
-        Binding("escape", "cancel", "Cancel"),
+        Binding("escape", "back", "Back"),
+        Binding("ctrl+d", "close", "Close", priority=True),
     ]
 
-    def __init__(self, provider: ProviderCatalogEntry, *, theme: TuiTheme) -> None:
+    def __init__(
+        self,
+        provider: ProviderCatalogEntry,
+        *,
+        theme: TuiTheme,
+        login: Callable[[OAuthLoginCallbacks], Awaitable[OAuthCredential]] | None = None,
+    ) -> None:
         super().__init__()
         self.provider = provider
         self.theme = theme
+        self._login = login
         self._manual_code_future: asyncio.Future[str] | None = None
         self._manual_code_value: str | None = None
+        self._prompt_allows_empty = False
 
     def compose(self) -> ComposeResult:
         """Compose the OAuth login prompt."""
         with Vertical(id="login-screen"):
             yield Static(f"Login: {self.provider.display_name}", id="login-title")
-            yield Static("Complete the browser login, or paste the redirect URL.", id="login-help")
+            yield Static("Follow the provider instructions to complete login.", id="login-help")
             yield Static("", id="login-oauth-url")
             yield Input(
                 placeholder="Paste redirect URL or authorization code",
                 id="login-oauth-code",
             )
-            yield Static("Enter submits - Escape closes", id="login-footer")
+            yield Static("Enter submits - Escape goes back - Ctrl+D closes", id="login-footer")
 
     def on_mount(self) -> None:
         """Focus the manual-code field and start OAuth."""
@@ -1352,10 +2144,19 @@ class OAuthLoginScreen(ModalScreen[OAuthCredential | None]):
 
     async def _run_login(self) -> None:
         try:
-            credential = await login_openai_codex(
-                on_auth=self._show_auth,
-                on_prompt=self._prompt_for_code,
-                on_manual_code_input=self._manual_code_input,
+            oauth_provider = get_oauth_provider(self.provider.name)
+            login = self._login or (oauth_provider.login if oauth_provider is not None else None)
+            if login is None:
+                raise RuntimeError(f"No OAuth implementation for {self.provider.name}")
+            credential = await login(
+                OAuthLoginCallbacks(
+                    on_auth=self._show_auth,
+                    on_device_code=self._show_device_code,
+                    on_prompt=self._prompt_for_code,
+                    on_select=self._select_option,
+                    on_progress=self._show_progress,
+                    on_manual_code_input=self._manual_code_input,
+                )
             )
         except Exception as exc:  # noqa: BLE001 - surface OAuth failures in the TUI
             self.query_one("#login-help", Static).update(f"OAuth failed: {exc}")
@@ -1367,9 +2168,26 @@ class OAuthLoginScreen(ModalScreen[OAuthCredential | None]):
         if info.instructions:
             self.query_one("#login-help", Static).update(info.instructions)
 
+    def _show_device_code(self, info: OAuthDeviceCodeInfo) -> None:
+        self.query_one("#login-oauth-url", Static).update(info.verification_uri)
+        self.query_one("#login-help", Static).update(
+            f"Open the URL and enter code: {info.user_code}"
+        )
+
+    def _show_progress(self, message: str) -> None:
+        self.query_one("#login-help", Static).update(message)
+
     async def _prompt_for_code(self, prompt: OAuthPrompt) -> str:
         self.query_one("#login-help", Static).update(prompt.message)
-        return await self._manual_code_input()
+        self._prompt_allows_empty = prompt.allow_empty
+        try:
+            return await self._manual_code_input()
+        finally:
+            self._prompt_allows_empty = False
+
+    async def _select_option(self, prompt: OAuthSelectPrompt) -> str | None:
+        self.query_one("#login-help", Static).update(prompt.message)
+        return prompt.options[0].id if prompt.options else None
 
     async def _manual_code_input(self) -> str:
         if self._manual_code_value is not None:
@@ -1387,17 +2205,39 @@ class OAuthLoginScreen(ModalScreen[OAuthCredential | None]):
             return
         event.stop()
         value = event.value.strip()
-        if not value:
+        if not value and not self._prompt_allows_empty:
             return
         self._manual_code_value = value
         if self._manual_code_future is not None and not self._manual_code_future.done():
             self._manual_code_future.set_result(value)
 
-    def action_cancel(self) -> None:
-        """Close without saving OAuth credentials."""
+    def action_back(self) -> None:
+        """Return to the login method picker without saving credentials."""
+        self._cancel_manual_code_input()
+        self.dismiss(_LoginFlowAction.BACK)
+
+    def action_close(self) -> None:
+        """Close the entire login flow without saving credentials."""
+        self._cancel_manual_code_input()
+        self.dismiss(None)
+
+    def _cancel_manual_code_input(self) -> None:
         if self._manual_code_future is not None and not self._manual_code_future.done():
             self._manual_code_future.cancel()
-        self.dismiss(None)
+
+
+#: Keys an extension key interceptor is never consulted for. These flow
+#: straight to normal dispatch so a buggy interceptor (one that returns True
+#: too broadly) cannot swallow the session's hard interrupt/exit reflexes and
+#: brick the TUI. Deliberately minimal — only the always-available escape
+#: hatches: ``ctrl+d`` (the ``quit`` action, exits the app) and ``ctrl+c``
+#: (Tau binds it to ``clear_prompt``, but it is the terminal-standard
+#: SIGINT/interrupt reflex users hit to bail). NOT reserved: escape/enter/
+#: arrows/tab/left/right — those are load-bearing for the tau-subagents
+#: extension and must stay interceptable. This is Tau's counterpart to Pi's
+#: ``RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS`` (runner.ts:69), applied
+#: here to the pre-dispatch interceptor rather than a registerShortcut API.
+RESERVED_EXTENSION_INTERCEPTOR_KEYS: frozenset[str] = frozenset({"ctrl+c", "ctrl+d"})
 
 
 class TauTuiApp(App[None]):
@@ -1468,6 +2308,12 @@ class TauTuiApp(App[None]):
         padding-left: 1;
     }
 
+    TauTuiApp.-sidebar-right #sidebar {
+        dock: right;
+        border-right: none;
+        border-left: tall $tau-border;
+    }
+
     #main-pane {
         width: 1fr;
         padding: 1 1 0 1;
@@ -1481,6 +2327,34 @@ class TauTuiApp(App[None]):
         overflow-x: auto;
         scrollbar-size-vertical: 0;
         scrollbar-size-horizontal: 1;
+    }
+
+    /* Component seam: generic extension mount points. */
+    #main-slot {
+        display: none;
+        height: 1fr;
+        border: none;
+        background: $tau-transcript-background;
+        padding: 0 0 0 2;
+        overflow-x: auto;
+        scrollbar-size-vertical: 0;
+        scrollbar-size-horizontal: 1;
+    }
+
+    #above-prompt-slot {
+        height: auto;
+        max-height: 8;
+        margin: 0 1 0 1;
+        padding: 0;
+        background: $tau-screen-background;
+    }
+
+    #below-prompt-slot {
+        height: auto;
+        max-height: 8;
+        margin: 0 1 0 1;
+        padding: 0;
+        background: $tau-screen-background;
     }
 
     #queued-messages {
@@ -1595,6 +2469,60 @@ class TauTuiApp(App[None]):
         color: $tau-muted-text;
     }
 
+    ExtensionSelectScreen,
+    ExtensionConfirmScreen,
+    ExtensionInputScreen {
+        align: center middle;
+    }
+
+    #extension-select,
+    #extension-confirm,
+    #extension-input {
+        width: 76;
+        max-width: 90%;
+        height: auto;
+        max-height: 70%;
+        padding: 1 2;
+        background: $tau-chrome-background;
+        border: tall $tau-border;
+    }
+
+    #extension-select-title,
+    #extension-confirm-title,
+    #extension-input-title {
+        height: auto;
+        color: $tau-chrome-text;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+
+    #extension-confirm-message {
+        height: auto;
+        color: $tau-chrome-text;
+        margin-bottom: 1;
+    }
+
+    #extension-select-list,
+    #extension-confirm-list {
+        height: auto;
+        max-height: 16;
+        background: $tau-transcript-background;
+        border: tall $tau-border;
+    }
+
+    #extension-input-field {
+        background: $tau-transcript-background;
+        border: tall $tau-border;
+    }
+
+    #extension-select-help,
+    #extension-confirm-help,
+    #extension-input-help {
+        height: 1;
+        margin-top: 1;
+        color: $tau-muted-text;
+    }
+
     #command-output {
         width: 76;
         max-width: 90%;
@@ -1693,9 +2621,11 @@ class TauTuiApp(App[None]):
     }
 
     #login-method-list {
-        max-height: 6;
+        height: auto;
+        max-height: 10;
     }
 
+    #login-provider-search,
     #model-picker-search {
         height: 3;
         margin-bottom: 1;
@@ -1713,6 +2643,7 @@ class TauTuiApp(App[None]):
         color: $tau-muted-text;
     }
 
+    CustomProviderLoginScreen,
     LoginScreen,
     OAuthLoginScreen {
         align: center middle;
@@ -1734,14 +2665,22 @@ class TauTuiApp(App[None]):
         margin-bottom: 1;
     }
 
-    #login-help {
+    #login-help,
+    #custom-provider-help {
         height: 1;
         color: $tau-muted-text;
         margin-bottom: 1;
     }
 
     #login-api-key,
-    #login-oauth-code {
+    #login-oauth-code,
+    #custom-provider-name,
+    #custom-provider-display-name,
+    #custom-provider-base-url,
+    #custom-provider-api-key-env,
+    #custom-provider-models,
+    #custom-provider-default-model,
+    #custom-provider-api-key {
         background: $tau-prompt-background;
         color: $tau-prompt-text;
         border: tall $tau-prompt-border;
@@ -1769,33 +2708,75 @@ class TauTuiApp(App[None]):
         tui_settings: TuiSettings | None = None,
         startup_message: str | None = None,
         startup_notice: str | None = None,
+        startup_notices: Sequence[str] = (),
         initial_prompt: str | None = None,
     ) -> None:
         self.tui_settings = tui_settings or TuiSettings()
         self.startup_message = startup_message
-        self.startup_notice = startup_notice
+        legacy_notices = (startup_notice,) if startup_notice else ()
+        self.startup_notices = tuple((*startup_notices, *legacy_notices))
         self.initial_prompt = initial_prompt
         super().__init__()
+        self._register_tau_textual_themes()
+        self.theme = self.tui_settings.theme
         self._bindings = BindingsMap(_app_bindings(self.tui_settings.keybindings))
         self.session = session
         self.state = TuiState(skills=session.skills)
-        if startup_notice:
-            self.state.add_item("status", startup_notice)
+        for notice in self.startup_notices:
+            self.state.add_item("status", notice)
         self._prompt_history: tuple[str, ...] = ()
         self._load_session_messages_from_session()
         self.adapter = TuiEventAdapter(self.state)
+        # Component seam: host-owned tracking of extension
+        # widgets so a reload/rebind can force-clear them and a crash can
+        # quarantine them. Must exist before _connect_extension_runtime, which
+        # clears them on every bind.
+        # `_extension_slot_widgets` holds the *intended* widget per key (the swap
+        # target, set synchronously); `_extension_slot_mounted` tracks what is
+        # actually mounted. A deferred remove() must fully drain before the next
+        # mount of the same-id widget, so slot/main-view swaps run on a serialized
+        # async continuation (see `_reconcile_slot`/`_reconcile_main_view`).
+        self._extension_slot_widgets: dict[str, Widget] = {}
+        self._extension_slot_mounted: dict[str, Widget] = {}
+        self._extension_slot_slot_ids: dict[str, str] = {}
+        self._extension_slot_locks: dict[str, asyncio.Lock] = {}
+        self._extension_key_interceptors: list[KeyInterceptor] = []
+        self._extension_main_view: _MainViewHandle | None = None
+        self._extension_main_view_mounted: Widget | None = None
+        self._extension_main_view_lock = asyncio.Lock()
+        self._extension_swap_tasks: set[asyncio.Task[None]] = set()
+        self._extension_component_failures_reported: set[str] = set()
+        self._connect_extension_runtime(session)
         self._prompt_worker: Worker[None] | None = None
         self._compaction_worker: Worker[None] | None = None
         self._prompt_run_id = 0
+        self._optimistic_user_messages: list[tuple[int, str]] = []
         self._completion_state = CompletionState()
+        self._completion_visible_line_budget: int | None = None
         self._activity_frame = 0
         self._activity_timer: Timer | None = None
+        self._terminal_title = TerminalTitleController()
         self._active_notification_keys: set[tuple[str, str]] = set()
         self._supports_pyperclip: bool | None = None
+        self._sync_header_title()
+
+    def _sync_header_title(self) -> None:
+        """Reflect the active session name in Textual's header state."""
+        self.title = "Tau"
+        self.sub_title = _session_header_sub_title(self.session)
+        self._sync_terminal_title()
+
+    def _sync_terminal_title(self) -> None:
+        """Reflect the active session name and running state in the terminal tab title."""
+        self._terminal_title.update(
+            getattr(self.session, "session_title", None),
+            running=self.state.running,
+            frame=self._activity_frame,
+        )
 
     def _sync_text_selection_state(self) -> None:
         """Disable native text selection while the transcript is mutating."""
-        self.ALLOW_SELECT = not self.state.running
+        type(self).ALLOW_SELECT = not self.state.running
         if self.state.running and self.screen_stack:
             with suppress(Exception):
                 self.screen.clear_selection()
@@ -1816,6 +2797,28 @@ class TauTuiApp(App[None]):
                 pyperclip.copy(text)
         super().copy_to_clipboard(text)
 
+    def _register_tau_textual_themes(self) -> None:
+        """Register Tau themes with Textual's theme system.
+
+        Textual exposes its own theme menu and command palette entries. Registering
+        Tau's built-in themes there makes those controls update the same theme as
+        `/theme` instead of changing only Textual's chrome.
+        """
+        self._registered_themes.clear()
+        for theme_name in BUILTIN_TUI_THEME_NAMES:
+            self.register_theme(_textual_theme_for_tau_theme(theme_name))
+
+    def _watch_theme(self, theme_name: str) -> None:
+        """Keep Textual theme changes synchronized with Tau's durable TUI theme."""
+        super()._watch_theme(theme_name)
+        if theme_name not in BUILTIN_TUI_THEME_NAMES:
+            return
+        tau_theme: TuiThemeName = theme_name
+        if self.tui_settings.theme == tau_theme:
+            return
+        self._replace_tui_settings(theme=tau_theme)
+        save_tui_settings(self.tui_settings)
+
     def get_theme_variable_defaults(self) -> dict[str, str]:
         """Return Tau-specific CSS variables for the selected TUI theme."""
         variables = super().get_theme_variable_defaults()
@@ -1834,16 +2837,21 @@ class TauTuiApp(App[None]):
                     highlight=True,
                     markup=False,
                 )
+                # Component seam: host-managed mount points for
+                # extension widgets. Empty until an extension mounts into them.
+                yield Container(id="main-slot")
+                yield Container(id="above-prompt-slot")
                 yield Static("", id="queued-messages")
                 with Horizontal(id="prompt-row"):
                     yield Static("τ", id="prompt-prefix")
                     yield PromptInput(
-                        placeholder="Ask Tau…  Enter submits, Shift+Enter inserts a newline",
+                        placeholder=PROMPT_PLACEHOLDER,
                         id="prompt",
                         tui_keybindings=self.tui_settings.keybindings,
                     )
                 yield CompactSessionInfo(id="compact-session-info")
                 yield Static("", id="autocomplete")
+                yield Container(id="below-prompt-slot")
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -1853,37 +2861,89 @@ class TauTuiApp(App[None]):
         self._sync_prompt_shell_mode(prompt.text)
         prompt.focus()
         self._update_responsive_layout(self.size.width, self.size.height)
+        self._apply_sidebar_position()
         self._refresh()
         self._sync_text_selection_state()
         self._refresh_completions()
         if self.startup_message:
             self._notify(self.startup_message, severity="warning")
+        # UI is live and the bridge is installed (__init__) — release the
+        # deferred session_start so handlers can notify / open dialogs.
+        await self.session.emit_pending_session_start()
         if self.initial_prompt and self.initial_prompt.strip():
-            self._submit_prompt(self.initial_prompt.strip())
+            await self._submit_prompt(self.initial_prompt.strip())
+
+    async def on_event(self, event: events.Event) -> None:
+        """Consult extension key interceptors before Textual's dispatch.
+
+        Ports Pi's ``onTerminalInput``: a registered interceptor sees a key at
+        the earliest point in key processing — before tau's app-level priority
+        bindings (``down``/``up``/``tab``/``alt+enter`` in ``_app_bindings``)
+        and before the focused widget. Textual's ``App.on_event`` runs
+        ``_check_bindings(key, priority=True)`` ahead of forwarding a key to the
+        focused widget, so a focused extension widget would otherwise never
+        receive those keys; this pre-dispatch hook is the only place an
+        extension can own them.
+
+        Interceptors are consulted only on the main screen (never while a modal
+        dialog/picker sits on the screen stack) and only when at least one is
+        registered, so the default path is untouched. Interceptors therefore
+        see EVERY main-screen key regardless of focus and must self-gate.
+
+        The hard interrupt/exit keys in
+        :data:`RESERVED_EXTENSION_INTERCEPTOR_KEYS` are skipped entirely, so
+        they always reach normal dispatch even behind a misbehaving interceptor.
+        """
+        if (
+            isinstance(event, events.Key)
+            and not event.is_forwarded
+            and event.key not in RESERVED_EXTENSION_INTERCEPTOR_KEYS
+            and self._extension_key_interceptors
+            and len(self.screen_stack) <= 1
+            and self._run_extension_key_interceptors(event, self._current_prompt_text())
+        ):
+            event.stop()
+            event.prevent_default()
+            return
+        await super().on_event(event)
 
     def on_unmount(self) -> None:
-        """Stop the activity timer when the app is torn down."""
+        """Stop activity animations and drop extension widgets on teardown."""
         if self._activity_timer is not None:
             self._activity_timer.stop()
             self._activity_timer = None
+        self._terminal_title.restore()
+        self._clear_extension_components()
 
     def on_resize(self, event: Resize) -> None:
         """Update responsive chrome when the terminal changes size."""
+        self._completion_visible_line_budget = None
         self._update_responsive_layout(event.size.width, event.size.height)
 
     def on_click(self, event: events.Click) -> None:
         """Return keyboard focus to the prompt after clicks in the main TUI."""
         if event.button != 1:
             return
+        if self._extension_main_view is not None:
+            # An extension main view (e.g. a subagent conversation viewer) owns
+            # the main area and its keyboard; yanking focus back to the prompt
+            # would silently reroute every key — esc, toggles, typed text — to
+            # the main chat. Clicking the prompt itself still focuses it via
+            # Textual's native mouse-down focus.
+            return
         with suppress(NoMatches):
             self.screen.query_one("#prompt", PromptInput).focus()
 
     @on(events.TextSelected)
     async def on_text_selected(self) -> None:
-        """Optionally copy selected transcript text automatically."""
-        if not self.tui_settings.auto_copy_selection:
+        """Optionally copy selected text automatically."""
+        active_screen = self.screen
+        if not (
+            self.tui_settings.auto_copy_selection
+            or getattr(active_screen, "auto_copy_selection", False)
+        ):
             return
-        selection = self.screen.get_selected_text()
+        selection = active_screen.get_selected_text()
         if selection:
             self.copy_to_clipboard(selection)
             self._notify("Copied selection to clipboard.")
@@ -1892,6 +2952,8 @@ class TauTuiApp(App[None]):
         """Update prompt autocomplete when the prompt text changes."""
         if event.text_area.id != "prompt":
             return
+        prompt = self.query_one("#prompt", PromptInput)
+        prompt.sync_pending_paste()
         self._sync_prompt_shell_mode(event.text_area.text)
         self._completion_state = self._build_completion_state(event.text_area.text)
         self._refresh_completions()
@@ -1910,10 +2972,11 @@ class TauTuiApp(App[None]):
         streaming_behavior: Literal["steer", "follow_up"],
     ) -> None:
         prompt = self.query_one("#prompt", PromptInput)
-        raw_text = prompt.text
+        raw_text = prompt.text_for_submission()
         applied_completion = self._apply_selected_completion(raw_text)
         if applied_completion is not None and applied_completion != raw_text:
             prompt.text = applied_completion
+            prompt._clear_pending_paste()
             prompt.move_cursor(_text_end_location(applied_completion))
             self._completion_state = self._build_completion_state(applied_completion)
             self._refresh_completions()
@@ -1922,6 +2985,7 @@ class TauTuiApp(App[None]):
         text = raw_text.strip()
         if not text:
             prompt.text = ""
+            prompt._clear_pending_paste()
             self._completion_state = CompletionState()
             self._refresh_completions()
             return
@@ -1939,6 +3003,7 @@ class TauTuiApp(App[None]):
             return
 
         prompt.text = ""
+        prompt._clear_pending_paste()
         self._completion_state = CompletionState()
         self._refresh_completions()
 
@@ -1957,6 +3022,13 @@ class TauTuiApp(App[None]):
         if command.handled:
             if command.clear_requested:
                 self.state.clear()
+            if command.reload_requested:
+                try:
+                    summary = await self.session.reload()
+                except ValueError as exc:
+                    command = replace(command, message=f"Could not reload: {exc}")
+                else:
+                    command = replace(command, message=format_reload_summary(summary))
             if command.new_session_requested:
                 await self._new_session()
             if command.compact_summary is not None:
@@ -1990,11 +3062,18 @@ class TauTuiApp(App[None]):
             if command.resume_picker_requested:
                 self.action_open_session_picker()
             if command.tree_picker_requested:
+                if self._is_agent_or_queue_active():
+                    prompt.text = raw_text
+                    prompt.move_cursor(_text_end_location(raw_text))
+                    self._notify(TREE_RUNNING_MESSAGE, severity="warning")
+                    return
                 await self._open_tree_picker()
             if command.login_picker_requested:
                 self._open_login_picker()
+            if command.custom_provider_login_requested:
+                self._open_custom_provider_login()
             if command.login_provider is not None:
-                self._open_login(command.login_provider)
+                self._open_login(command.login_provider, method=command.login_method)
             if command.logout_picker_requested:
                 self._open_logout_picker()
             if command.logout_provider is not None:
@@ -2028,7 +3107,7 @@ class TauTuiApp(App[None]):
             return
 
         self._remember_prompt(text)
-        self._submit_prompt(text)
+        await self._submit_prompt(text)
 
     def _remember_prompt(self, text: str) -> None:
         """Remember a submitted user prompt for lightweight input recall."""
@@ -2083,13 +3162,574 @@ class TauTuiApp(App[None]):
         self._notify(compact_message)
         self._refresh()
 
-    def _submit_prompt(self, text: str) -> None:
+    async def _submit_prompt(
+        self,
+        text: str,
+        *,
+        source: Literal["interactive", "extension"] = "interactive",
+        custom_type: str | None = None,
+        details: dict[str, JSONValue] | None = None,
+    ) -> None:
         """Add a prompt to the transcript and start the agent worker."""
         self._prompt_run_id += 1
         run_id = self._prompt_run_id
+        # Custom messages are never rendered optimistically: the optimistic
+        # dedupe matches on exact content equality with the post-expansion
+        # event (see _consume_optimistic_user_event), and a mismatch would
+        # double-render. They render once, from the confirmed user event,
+        # which carries their custom_type/details.
+        if custom_type is None and _should_optimistically_render_prompt(text):
+            self._optimistic_user_messages.append((run_id, text))
+            await self._append_optimistic_user_message(text)
+        self._prompt_worker = self.run_worker(
+            self._run_prompt(text, run_id, source=source, custom_type=custom_type, details=details),
+            exclusive=True,
+        )
+
+    async def _append_optimistic_user_message(
+        self,
+        text: str,
+        *,
+        custom_type: str | None = None,
+        details: dict[str, JSONValue] | None = None,
+    ) -> None:
+        """Render a submitted user message immediately without rebuilding the transcript."""
+        start_index = len(self.state.items)
+        self.state.add_user_message(text, custom_type=custom_type, details=details)
         self._follow_transcript_output()
-        self._refresh()
-        self._prompt_worker = self.run_worker(self._run_prompt(text, run_id), exclusive=True)
+        if not self.screen_stack:
+            self._refresh()
+            return
+        theme = self.tui_settings.resolved_theme
+        try:
+            transcript = self.query_one("#transcript", TranscriptView)
+        except NoMatches:
+            self._refresh()
+            return
+        for item in self.state.items[start_index:]:
+            await transcript.append_item(
+                item,
+                theme=theme,
+                show_tool_results=self.state.show_tool_results,
+                scroll_end=True,
+                custom_markup=self.state.resolve_custom_markup(
+                    item, expanded=self.state.show_tool_results
+                ),
+            )
+        self._refresh_chrome(theme=theme)
+
+    def _consume_optimistic_user_event(self, event: AgentEvent, *, run_id: int) -> bool:
+        """Return whether a user event confirms an already-rendered optimistic message."""
+        if not isinstance(event, MessageEndEvent) or not isinstance(event.message, UserMessage):
+            return False
+        for index, (pending_run_id, pending_text) in enumerate(self._optimistic_user_messages):
+            if pending_run_id == run_id and pending_text == event.message.content:
+                del self._optimistic_user_messages[index]
+                return True
+        return False
+
+    def _replace_transformed_optimistic_user_message(
+        self, event: AgentEvent, *, run_id: int
+    ) -> bool:
+        """Reconcile a transformed prompt with its optimistic render.
+
+        An extension `input` hook may transform the submitted text inside
+        session.prompt, so the confirmed UserMessage no longer matches the
+        optimistically rendered original (the exact-equality path above).
+        Rewrite the optimistic item in place and redraw, instead of letting
+        the confirmed event append a second user item alongside the stale
+        original. Runs after _consume_optimistic_user_event, so it only fires
+        when this run's pending optimistic text mismatches — the run's own
+        prompt confirmation is the first user event of the run, so a queued
+        steering/follow-up user message can never be mistaken for it.
+        """
+        if not isinstance(event, MessageEndEvent) or not isinstance(event.message, UserMessage):
+            return False
+        for index, (pending_run_id, pending_text) in enumerate(self._optimistic_user_messages):
+            if pending_run_id != run_id:
+                continue
+            del self._optimistic_user_messages[index]
+            for item in reversed(self.state.items):
+                if item.role == "user" and item.text == pending_text:
+                    item.text = event.message.content
+                    break
+            self._refresh()
+            self._sync_header_title()
+            return True
+        return False
+
+    def _clear_optimistic_user_messages(self, *, run_id: int) -> None:
+        """Drop unconfirmed optimistic messages once their run is no longer active."""
+        self._optimistic_user_messages = [
+            pending for pending in self._optimistic_user_messages if pending[0] != run_id
+        ]
+
+    async def _append_confirmed_user_message(self, message: AgentMessage) -> None:
+        """Render a non-optimistic user event incrementally when possible."""
+        if not isinstance(message, UserMessage):
+            self._refresh()
+            return
+        await self._append_optimistic_user_message(
+            message.content,
+            custom_type=message.custom_type,
+            details=message.details,
+        )
+
+    def _connect_extension_runtime(self, session: CodingSession) -> None:
+        """Give the extension runtime a UI bridge and an idle-run entry point."""
+        runtime = getattr(session, "extension_runtime", None)
+        if runtime is None:
+            return
+        # Force-clear any extension widgets before installing the new bridge.
+        # This runs once, at construction; later teardowns (/reload, resume,
+        # new) come through the installed bridge's clear_components(), driven
+        # by the runtime, so extension widgets and key interceptors never
+        # survive a world they were mounted in.
+        self._clear_extension_components()
+        runtime.set_ui_bridge(_TuiExtensionUiBridge(self))
+        runtime.set_turn_requested_callback(self._on_extension_turn_requested)
+        # Let the transcript render custom messages via registered renderers.
+        self.state.custom_renderer = runtime.render_custom_message
+        # Let tool calls render through their tool's render_call, if any.
+        self.state.tool_call_renderer = runtime.render_tool_call
+        # And tool results through their tool's render_result, if any.
+        self.state.tool_result_renderer = runtime.render_tool_result
+
+    def _on_extension_turn_requested(
+        self,
+        content: str,
+        custom_type: str | None = None,
+        details: dict[str, JSONValue] | None = None,
+    ) -> None:
+        """Deliver an extension message through the serialized prompt path."""
+        self.call_later(self._deliver_extension_message, content, custom_type, details)
+
+    async def _deliver_extension_message(
+        self,
+        content: str,
+        custom_type: str | None = None,
+        details: dict[str, JSONValue] | None = None,
+    ) -> None:
+        if self.session.is_running or self._prompt_worker is not None:
+            # A run started while the delivery was in flight; drain with it.
+            queue_follow_up = getattr(self.session, "queue_follow_up_message", None)
+            if callable(queue_follow_up):
+                queue_follow_up(content, custom_type=custom_type, details=details)
+            return
+        await self._submit_prompt(
+            content, source="extension", custom_type=custom_type, details=details
+        )
+
+    # -- component seam ------------------------------------------------------
+
+    def _current_prompt_text(self) -> str:
+        """Return the prompt-editor text, or "" before the prompt exists."""
+        try:
+            return self.query_one("#prompt", PromptInput).text
+        except NoMatches:
+            return ""
+
+    def _register_extension_key_interceptor(self, handler: KeyInterceptor) -> Callable[[], None]:
+        """Register a pre-dispatch key interceptor; return an unsubscribe fn."""
+        self._extension_key_interceptors.append(handler)
+
+        def unsubscribe() -> None:
+            with suppress(ValueError):
+                self._extension_key_interceptors.remove(handler)
+
+        return unsubscribe
+
+    def _run_extension_key_interceptors(self, event: Key, text: str) -> bool:
+        """Consult interceptors; return True if one consumed the key.
+
+        Each call is guarded: a raising interceptor is diagnosed once and
+        treated as "not consumed", so a broken interceptor degrades to normal
+        typing rather than a dead prompt.
+        """
+        for interceptor in tuple(self._extension_key_interceptors):
+            try:
+                if interceptor(event, text):
+                    return True
+            except Exception as exc:  # noqa: BLE001 - isolation boundary
+                # Notify like the other failure classes so a broken interceptor
+                # is not silently invisible, and dedup per-interceptor so a
+                # second faulty handler still gets diagnosed.
+                self._record_extension_component_failure(
+                    f"key_interceptor:{id(interceptor)}", exc, notify=True
+                )
+        return False
+
+    def _schedule_extension_swap(self, coro: Coroutine[object, object, None]) -> None:
+        """Run a slot/main-view reconcile coroutine on the app loop.
+
+        The task is retained until it finishes so it cannot be garbage-collected
+        mid-flight (asyncio only holds a weak reference). If there is no running
+        loop (only possible outside a live TUI), the coroutine is closed rather
+        than left un-awaited.
+        """
+        try:
+            task = asyncio.ensure_future(coro)
+        except RuntimeError:  # no running loop — not a live TUI
+            coro.close()
+            return
+        self._extension_swap_tasks.add(task)
+        task.add_done_callback(self._extension_swap_tasks.discard)
+
+    @staticmethod
+    def _string_slot_widget(lines: Sequence[str]) -> Static:
+        """Build a slot ``Static`` from display lines (Rich markup, safe fallback).
+
+        Joins ``lines`` with newlines and parses them as Rich markup; if the
+        markup is malformed the literal text is shown instead, mirroring the
+        custom-message renderer's guard so a bad string never crashes the TUI.
+        """
+        content = "\n".join(lines)
+        return Static(_custom_markup_to_text(content))
+
+    def _set_extension_slot_widget(
+        self,
+        key: str,
+        content: SlotWidgetContent | None,
+        placement: Placement,
+    ) -> None:
+        """Mount an extension widget into a prompt-adjacent slot, or unmount it.
+
+        ``content`` is a ``factory(theme)`` callable, a list of display lines
+        the host renders into a ``Static``, or ``None`` to unmount. The string
+        form is normalized into a factory here so the reconcile/quarantine/
+        replace machinery below is untouched.
+
+        The intended widget is recorded synchronously so mid-swap reads (clear,
+        quarantine, refresh) see what *should* occupy the slot; the actual
+        mount/unmount runs on a serialized continuation so a deferred remove()
+        of a same-id widget fully drains before the replacement mounts (else the
+        DOM briefly holds two widgets with one id -> ``DuplicateIds``).
+        """
+        factory: SlotWidgetFactory | None
+        if content is None:
+            factory = None
+        elif callable(content):
+            # Check callable() first: a Sequence[str] test must never swallow a
+            # factory (and a factory is not a Sequence).
+            factory = content
+        else:
+            # A plain list of display lines: build the widget host-side so the
+            # extension needs no Textual import. A bare str is treated as one
+            # line (never split into characters).
+            lines = [content] if isinstance(content, str) else list(content)
+            factory = lambda _theme: self._string_slot_widget(lines)  # noqa: E731
+        new_widget: Widget | None = None
+        if factory is not None:
+            try:
+                new_widget = factory(self.tui_settings.resolved_theme)
+            except Exception as exc:  # noqa: BLE001 - isolation boundary
+                self._record_extension_component_failure(f"slot:{key}", exc, notify=True)
+                return
+        slot_id = "above-prompt-slot" if placement == "above_prompt" else "below-prompt-slot"
+        if new_widget is None:
+            self._extension_slot_widgets.pop(key, None)
+            self._extension_slot_slot_ids.pop(key, None)
+        else:
+            self._extension_slot_widgets[key] = new_widget
+            self._extension_slot_slot_ids[key] = slot_id
+        self._schedule_extension_swap(self._reconcile_slot(key))
+
+    async def _reconcile_slot(self, key: str) -> None:
+        """Make the mounted slot widget match the intended target (serialized).
+
+        Reads the *live* target each time (not a snapshot), so a burst of set
+        calls collapses to "last writer wins": the first continuation removes the
+        stale mount, later ones find the target already satisfied and no-op.
+        """
+        lock = self._extension_slot_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            target = self._extension_slot_widgets.get(key)
+            mounted = self._extension_slot_mounted.get(key)
+            if mounted is not None and mounted is not target:
+                with suppress(Exception):
+                    await mounted.remove()
+                if self._extension_slot_mounted.get(key) is mounted:
+                    self._extension_slot_mounted.pop(key, None)
+            # Re-read after the await; the target may have changed meanwhile.
+            target = self._extension_slot_widgets.get(key)
+            if target is None or self._extension_slot_mounted.get(key) is target:
+                return
+            slot_id = self._extension_slot_slot_ids.get(key, "below-prompt-slot")
+            try:
+                self.query_one(f"#{slot_id}", Container).mount(target)
+            except Exception as exc:  # noqa: BLE001 - isolation boundary
+                if self._extension_slot_widgets.get(key) is target:
+                    self._extension_slot_widgets.pop(key, None)
+                    self._extension_slot_slot_ids.pop(key, None)
+                self._record_extension_component_failure(f"slot:{key}", exc, notify=True)
+                return
+            self._extension_slot_mounted[key] = target
+
+    def _open_extension_main_view(self, factory: MainViewFactory) -> MainViewHandle:
+        """Open a display-toggled main-area view mounting ``factory(handle, theme)``.
+
+        Prompt focus is intentionally left where it is (the extension widget can
+        focus its own composer), so a registered key interceptor keeps firing
+        while the prompt is focused and can close the view on Esc.
+
+        The handle is returned synchronously (the factory needs it and callers
+        store it at once), but the mount is sequenced after any previous view's
+        remove() drains, so switching views never collides on the shared main
+        slot. ``is_open`` reports the *intended* state: the new handle is open
+        the instant it is returned even though its widget mounts a tick later.
+        """
+        handle = _MainViewHandle(self, asyncio.get_event_loop().create_future())
+        try:
+            widget = factory(handle, self.tui_settings.resolved_theme)
+        except Exception as exc:  # noqa: BLE001 - isolation boundary
+            self._record_extension_component_failure("main_view", exc, notify=True)
+            # Nothing awaits this handle (the extension gets the dead one), but
+            # resolve it anyway so no future leaks unresolved.
+            handle._resolve(None)
+            return _DeadMainViewHandle()
+        handle.widget = widget
+        previous = self._extension_main_view
+        if previous is not None and previous is not handle:
+            # Superseded (last writer wins): its close() becomes a no-op so a
+            # stale Esc/unmount can't tear down the view that replaced it, and
+            # its pending wait() resolves with None.
+            self._release_main_view_handle(previous)
+        self._extension_main_view = handle
+        self._schedule_extension_swap(self._reconcile_main_view())
+        return handle
+
+    async def _reconcile_main_view(self) -> None:
+        """Make the mounted main view match the intended handle (serialized)."""
+        async with self._extension_main_view_lock:
+            target = self._extension_main_view
+            target_widget = target.widget if target is not None else None
+            mounted = self._extension_main_view_mounted
+            if mounted is not None and mounted is not target_widget:
+                with suppress(Exception):
+                    await mounted.remove()
+                if self._extension_main_view_mounted is mounted:
+                    self._extension_main_view_mounted = None
+            # Re-read after the await.
+            target = self._extension_main_view
+            target_widget = target.widget if target is not None else None
+            if target_widget is not None and self._extension_main_view_mounted is not target_widget:
+                try:
+                    slot = self.query_one("#main-slot", Container)
+                    slot.mount(target_widget)
+                except Exception as exc:  # noqa: BLE001 - isolation boundary
+                    if self._extension_main_view is target:
+                        self._extension_main_view = None
+                    self._release_main_view_handle(target)
+                    self._record_extension_component_failure("main_view", exc, notify=True)
+                    self._restore_main_transcript()
+                    return
+                self._extension_main_view_mounted = target_widget
+                with suppress(NoMatches):
+                    self.query_one("#transcript", TranscriptView).display = False
+                slot.display = True
+            elif self._extension_main_view is None and self._extension_main_view_mounted is None:
+                # A close (target cleared) with nothing left to show.
+                self._restore_main_transcript()
+
+    def _close_extension_main_view(self, handle: _MainViewHandle) -> None:
+        """Unmount a main view and restore the main transcript (sequenced)."""
+        if self._extension_main_view is not handle:
+            return
+        self._extension_main_view = None
+        self._schedule_extension_swap(self._reconcile_main_view())
+
+    def _release_main_view_handle(self, handle: _MainViewHandle | None) -> None:
+        """Mark a host-torn-down handle closed and resolve its ``wait()`` with None.
+
+        Used by the teardown paths the host drives itself (supersede, session
+        rebind, mount failure, quarantine) — as opposed to an explicit
+        ``handle.close(result)`` from the extension — so a pending ``wait()``
+        never leaks unresolved and ``is_open`` reports False.
+        """
+        if handle is None:
+            return
+        handle._open = False
+        handle._resolve(None)
+
+    def _restore_main_transcript(self) -> None:
+        """Hide the main slot and bring the main transcript back into focus."""
+        if not self.screen_stack:
+            return
+        with suppress(NoMatches):
+            self.query_one("#main-slot", Container).display = False
+        with suppress(NoMatches):
+            pane = self.query_one("#transcript", TranscriptView)
+            pane.display = True
+            # Re-anchor the restored main transcript so returning to a live
+            # conversation lands at the bottom (mirrors _follow_transcript_output).
+            pane.follow_output()
+        with suppress(NoMatches):
+            self.query_one("#prompt", PromptInput).focus()
+
+    def _refresh_extension_components(self) -> None:
+        """Re-render all mounted extension widgets (analog of requestRender)."""
+        for widget in tuple(self._extension_slot_widgets.values()):
+            with suppress(Exception):
+                widget.refresh()
+        handle = self._extension_main_view
+        if handle is not None and handle.widget is not None:
+            with suppress(Exception):
+                handle.widget.refresh()
+
+    def _clear_extension_components(self) -> None:
+        """Force-clear every tracked extension widget, view, and interceptor.
+
+        The runtime drives this through the UI bridge on `/reload` and session
+        rebinds (resume/new); it also runs on app teardown, so a leaked
+        extension widget never survives a session switch. Intent is cleared
+        synchronously — mid-swap reads and in-flight continuations then see
+        empty state — while the actual unmounts run on the same serialized
+        per-key reconciles as ordinary swaps, so a clear followed immediately
+        by a re-mount of a same-id widget (a session_start handler re-mounting
+        after a rebind) can never hold two widgets with one id
+        (``DuplicateIds``).
+        """
+        slot_keys = {*self._extension_slot_widgets, *self._extension_slot_mounted}
+        self._extension_slot_widgets.clear()
+        self._extension_slot_slot_ids.clear()
+        for key in slot_keys:
+            self._schedule_extension_swap(self._reconcile_slot(key))
+        handle = self._extension_main_view
+        self._extension_main_view = None
+        self._release_main_view_handle(handle)
+        self._schedule_extension_swap(self._reconcile_main_view())
+        self._extension_key_interceptors.clear()
+        # A recurring failure context must notify again in the new world.
+        self._extension_component_failures_reported.clear()
+
+    def _tracked_extension_widgets(self) -> tuple[Widget, ...]:
+        """Return every extension widget the host currently tracks (intended or mounted)."""
+        widgets: list[Widget] = []
+        seen: set[int] = set()
+        for widget in (
+            *self._extension_slot_widgets.values(),
+            *self._extension_slot_mounted.values(),
+        ):
+            if id(widget) not in seen:
+                seen.add(id(widget))
+                widgets.append(widget)
+        handle = self._extension_main_view
+        main_widgets = (
+            handle.widget if handle is not None else None,
+            self._extension_main_view_mounted,
+        )
+        for main_widget in main_widgets:
+            if main_widget is not None and id(main_widget) not in seen:
+                seen.add(id(main_widget))
+                widgets.append(main_widget)
+        return tuple(widgets)
+
+    def _extension_root_for(self, widget: Widget, tracked: tuple[Widget, ...]) -> Widget | None:
+        """Return the tracked extension root that owns ``widget``, if any."""
+        node: Widget | None = widget
+        while node is not None:
+            for root in tracked:
+                if node is root:
+                    return root
+            node = node.parent if isinstance(node.parent, Widget) else None
+        return None
+
+    def _quarantine_extension_widget(self, error: BaseException) -> bool:
+        """Remove the tracked extension widget implicated in ``error``.
+
+        Returns True when a culprit was found and torn down (so the app can
+        swallow the exception and stay alive), False otherwise (so core bugs
+        still surface). Textual runs ``render`` on the compositor's own reflow
+        loop, so a child's render/compose/on_mount crash cannot be caught at the
+        mount site; walking the traceback for a frame owned by a tracked widget
+        is the only handle we get.
+        """
+        tracked = self._tracked_extension_widgets()
+        if not tracked:
+            return False
+        tb = error.__traceback__
+        culprit: Widget | None = None
+        while tb is not None:
+            candidate = tb.tb_frame.f_locals.get("self")
+            if isinstance(candidate, Widget):
+                root = self._extension_root_for(candidate, tracked)
+                if root is not None:
+                    culprit = root
+                    break
+            tb = tb.tb_next
+        if culprit is None:
+            return False
+        # Suppress the ghost first: a widget that crashed in on_mount never
+        # finished mounting, so remove() cannot fully prune it, but hiding and
+        # disabling it makes it inert and invisible. A render-crash widget
+        # removes cleanly. Either way the app keeps running.
+        with suppress(Exception):
+            culprit.display = False
+        with suppress(Exception):
+            culprit.disabled = True
+        if (
+            self._extension_main_view is not None and self._extension_main_view.widget is culprit
+        ) or self._extension_main_view_mounted is culprit:
+            if self._extension_main_view_mounted is culprit:
+                self._extension_main_view_mounted = None
+            handle = self._extension_main_view
+            self._extension_main_view = None
+            self._release_main_view_handle(handle)
+            with suppress(Exception):
+                culprit.remove()
+            self._restore_main_transcript()
+        else:
+            for tracker in (self._extension_slot_widgets, self._extension_slot_mounted):
+                key = next((k for k, w in tracker.items() if w is culprit), None)
+                if key is not None:
+                    tracker.pop(key, None)
+            with suppress(Exception):
+                culprit.remove()
+        self._record_extension_component_failure(f"render:{id(culprit)}", error, notify=True)
+        return True
+
+    def _handle_exception(self, error: Exception) -> None:
+        """Quarantine a crashing extension widget instead of tearing down.
+
+        Overrides Textual's private ``App._handle_exception`` (there is no
+        public error hook — ``hasattr(App, "on_exception")`` is False on the
+        pinned Textual). If the traceback touches a tracked extension widget we
+        remove it and keep running; otherwise we defer to Textual's default so
+        core's own bugs still surface. This private-API coupling is a contract
+        cost the component-seam experiment deliberately accepts.
+        """
+        if self._quarantine_extension_widget(error):
+            return
+        super()._handle_exception(error)
+
+    def _record_extension_component_failure(
+        self, context: str, error: BaseException, *, notify: bool = False
+    ) -> None:
+        """Diagnose an extension-component failure once per context.
+
+        The notification carries a short exception summary so the failure is
+        identifiable at a glance; the full traceback goes to the app log for a
+        post-mortem (the two together are what let us pin the deferred-remove
+        ``DuplicateIds`` race).
+        """
+        # Always log the traceback, even on a duplicate context, so a repeating
+        # failure leaves a full trail.
+        with suppress(Exception):
+            self.log.error(
+                f"Extension component failed ({context}):\n"
+                + "".join(traceback.format_exception(type(error), error, error.__traceback__))
+            )
+        if context in self._extension_component_failures_reported:
+            return
+        self._extension_component_failures_reported.add(context)
+        if notify:
+            summary = f"{type(error).__name__}: {error}"
+            if len(summary) > 120:
+                summary = summary[:117] + "..."
+            self._notify(
+                f"An extension component failed ({context}) and was removed ({summary}).",
+                severity="error",
+            )
 
     def _follow_transcript_output(self) -> None:
         """Put the transcript back in follow mode for explicit user actions."""
@@ -2139,14 +3779,19 @@ class TauTuiApp(App[None]):
         self._follow_transcript_output()
         self._refresh()
 
-    def _set_tui_theme(self, theme: TuiThemeName) -> None:
+    def _replace_tui_settings(self, *, theme: TuiThemeName) -> None:
+        """Replace the current immutable TUI settings with a new theme."""
         self.tui_settings = TuiSettings(
             keybindings=self.tui_settings.keybindings,
             theme=theme,
             auto_copy_selection=self.tui_settings.auto_copy_selection,
+            sidebar_position=self.tui_settings.sidebar_position,
         )
+
+    def _set_tui_theme(self, theme: TuiThemeName) -> None:
+        self._replace_tui_settings(theme=theme)
         save_tui_settings(self.tui_settings)
-        self.refresh_css(animate=False)
+        self.theme = theme
         self._refresh()
 
     async def _queue_prompt(
@@ -2164,14 +3809,32 @@ class TauTuiApp(App[None]):
             return
         self._refresh()
 
-    async def _run_prompt(self, text: str, run_id: int | None = None) -> None:
+    async def _run_prompt(
+        self,
+        text: str,
+        run_id: int | None = None,
+        *,
+        source: Literal["interactive", "extension"] = "interactive",
+        custom_type: str | None = None,
+        details: dict[str, JSONValue] | None = None,
+    ) -> None:
         """Run one prompt and stream session events into the TUI state."""
         active_run_id = self._prompt_run_id if run_id is None else run_id
         try:
-            async for event in self.session.prompt(text):
+            async for event in self.session.prompt(
+                text, source=source, custom_type=custom_type, details=details
+            ):
                 if active_run_id != self._prompt_run_id:
                     return
-                self.adapter.apply(event)
+                if self._consume_optimistic_user_event(event, run_id=active_run_id):
+                    self._sync_text_selection_state()
+                    self._refresh_chrome()
+                    continue
+                if self._replace_transformed_optimistic_user_message(event, run_id=active_run_id):
+                    self._sync_text_selection_state()
+                    continue
+                if not (_is_user_message_end_event(event) and self.screen_stack):
+                    self.adapter.apply(event)
                 self._sync_text_selection_state()
                 if isinstance(event, ErrorEvent) and not event.recoverable:
                     _attach_diagnostic_log_path_to_error(self.state, self.session)
@@ -2186,6 +3849,7 @@ class TauTuiApp(App[None]):
             self._sync_text_selection_state()
             self._refresh()
         finally:
+            self._clear_optimistic_user_messages(run_id=active_run_id)
             if active_run_id == self._prompt_run_id:
                 self._prompt_worker = None
 
@@ -2223,7 +3887,8 @@ class TauTuiApp(App[None]):
             return
         if isinstance(event, MessageEndEvent):
             if event.message.role == "user":
-                self._refresh()
+                await self._append_confirmed_user_message(event.message)
+                self._sync_header_title()
                 return
             if event.message.role == "assistant":
                 await transcript.finish_assistant_message(event.message.content)
@@ -2232,14 +3897,30 @@ class TauTuiApp(App[None]):
             return
         if isinstance(event, ToolExecutionStartEvent):
             await transcript.finish_assistant_message()
+            item = self.state.items[-1]
             await transcript.append_item(
-                self.state.items[-1],
+                item,
                 theme=theme,
                 show_tool_results=self.state.show_tool_results,
+                invocation=self.state.resolve_tool_invocation(item),
             )
             self._refresh_chrome()
             return
-        if isinstance(event, ToolExecutionUpdateEvent | RetryEvent | ErrorEvent):
+        if isinstance(event, ToolExecutionUpdateEvent):
+            await transcript.finish_assistant_message()
+            updated_item = self.state.find_tool_item(event.tool_call_id)
+            if updated_item is not None:
+                expanded = self.state.show_tool_results or updated_item.always_show_tool_result
+                await transcript.update_item(
+                    updated_item,
+                    theme=theme,
+                    show_tool_results=expanded,
+                    invocation=self.state.resolve_tool_invocation(updated_item),
+                    result_markup=self.state.resolve_tool_result(updated_item, expanded=expanded),
+                )
+            self._refresh_chrome()
+            return
+        if isinstance(event, RetryEvent | ErrorEvent):
             await transcript.finish_assistant_message()
             if self.state.items:
                 await transcript.append_item(
@@ -2313,7 +3994,9 @@ class TauTuiApp(App[None]):
             | TreePickerScreen
             | LoginMethodPickerScreen
             | LoginProviderPickerScreen
-            | ThemePickerScreen,
+            | ThemePickerScreen
+            | ExtensionSelectScreen
+            | ExtensionConfirmScreen,
         ):
             self.screen.action_select_cursor()
             return
@@ -2338,7 +4021,9 @@ class TauTuiApp(App[None]):
             | LoginMethodPickerScreen
             | LoginProviderPickerScreen
             | ThemePickerScreen
-            | ModelPickerScreen,
+            | ModelPickerScreen
+            | ExtensionSelectScreen
+            | ExtensionConfirmScreen,
         ):
             self.screen.action_cursor_down()
             return
@@ -2360,12 +4045,14 @@ class TauTuiApp(App[None]):
             | LoginMethodPickerScreen
             | LoginProviderPickerScreen
             | ThemePickerScreen
-            | ModelPickerScreen,
+            | ModelPickerScreen
+            | ExtensionSelectScreen
+            | ExtensionConfirmScreen,
         ):
             self.screen.action_cursor_up()
             return
         if not self._completion_state.items:
-            if self.action_edit_queued_follow_up():
+            if self.action_edit_queued_message():
                 return
             if self.action_recall_previous_prompt():
                 return
@@ -2388,17 +4075,15 @@ class TauTuiApp(App[None]):
         self._refresh_completions()
         return True
 
-    def action_edit_queued_follow_up(self) -> bool:
-        """Move the latest queued follow-up back into the prompt for editing."""
+    def action_edit_queued_message(self) -> bool:
+        """Move the latest queued message back into the prompt for editing."""
         if not self.state.running:
             return False
         prompt = self.query_one("#prompt", PromptInput)
         if prompt.text.strip():
             return False
-        pop_follow_up = getattr(self.session, "pop_latest_follow_up_message", None)
-        if not callable(pop_follow_up):
-            return False
-        message = pop_follow_up()
+
+        message = self._pop_latest_queued_message()
         if not message:
             return False
         prompt.text = message
@@ -2407,6 +4092,26 @@ class TauTuiApp(App[None]):
         self._completion_state = self._build_completion_state(prompt.text)
         self._refresh()
         return True
+
+    def action_edit_queued_follow_up(self) -> bool:
+        """Move the latest queued message back into the prompt for editing."""
+        return self.action_edit_queued_message()
+
+    def _pop_latest_queued_message(self) -> str | None:
+        """Pop the latest queued follow-up or steering message from the session."""
+        pop_follow_up = getattr(self.session, "pop_latest_follow_up_message", None)
+        if callable(pop_follow_up):
+            message = pop_follow_up()
+            if isinstance(message, str) and message:
+                return message
+
+        pop_steering = getattr(self.session, "pop_latest_steering_message", None)
+        if callable(pop_steering):
+            message = pop_steering()
+            if isinstance(message, str) and message:
+                return message
+
+        return None
 
     def action_open_command_palette(self) -> None:
         """Open the slash-command palette in the prompt."""
@@ -2451,7 +4156,11 @@ class TauTuiApp(App[None]):
     def action_toggle_thinking(self) -> None:
         """Toggle thinking-token display in the transcript."""
         self.state.toggle_thinking()
-        self._refresh()
+        transcript = self.query_one("#transcript", TranscriptView)
+        transcript.update_thinking_visibility(
+            self.state,
+            theme=self.tui_settings.resolved_theme,
+        )
 
     def _handle_session_picker_result(self, session_id: str | None) -> None:
         if session_id is None:
@@ -2470,6 +4179,9 @@ class TauTuiApp(App[None]):
         self._refresh()
 
     async def _open_tree_picker(self) -> None:
+        if self._is_agent_or_queue_active():
+            self._notify(TREE_RUNNING_MESSAGE, severity="warning")
+            return
         tree_choices = getattr(self.session, "tree_choices", None)
         if tree_choices is None:
             self._notify("Session tree is not available.", severity="warning")
@@ -2506,6 +4218,9 @@ class TauTuiApp(App[None]):
         summarize: bool,
         custom_instructions: str | None = None,
     ) -> None:
+        if self._is_agent_or_queue_active():
+            self._notify(TREE_RUNNING_MESSAGE, severity="warning")
+            return
         branch_to_entry = getattr(self.session, "branch_to_entry", None)
         if branch_to_entry is None:
             self._notify("Session tree is not available.", severity="warning")
@@ -2570,6 +4285,7 @@ class TauTuiApp(App[None]):
                 _command_output_title(command_text),
                 message,
                 theme=self.tui_settings.resolved_theme,
+                auto_copy_selection=command_text.strip().split(maxsplit=1)[0] == "/session",
             )
         )
 
@@ -2586,6 +4302,9 @@ class TauTuiApp(App[None]):
             providers = _subscription_login_providers(BUILTIN_PROVIDER_CATALOG)
         elif method == "api-key":
             providers = _api_key_login_providers(BUILTIN_PROVIDER_CATALOG)
+        elif method == "custom":
+            self._open_custom_provider_login()
+            return
         else:
             self._notify(f"Unknown login method: {method}", severity="error")
             return
@@ -2596,33 +4315,130 @@ class TauTuiApp(App[None]):
             LoginProviderPickerScreen(
                 providers,
                 theme=self.tui_settings.resolved_theme,
+                back_on_cancel=True,
             ),
-            callback=self._handle_login_provider_result,
+            callback=lambda provider_name: self._handle_login_provider_result(
+                provider_name,
+                method=method,
+            ),
         )
 
-    def _handle_login_provider_result(self, provider_name: str | None) -> None:
-        if provider_name is None:
-            return
-        self._open_login(provider_name)
+    def _handle_login_provider_result(
+        self,
+        provider_name: str | _LoginFlowAction | None,
+        *,
+        method: str | None = None,
+    ) -> None:
+        if provider_name is _LoginFlowAction.BACK:
+            self._open_login_picker()
+        elif provider_name is not None:
+            self._open_login(provider_name, method=method)
 
-    def _open_login(self, provider_name: str) -> None:
+    def _open_custom_provider_login(self) -> None:
+        self.push_screen(
+            CustomProviderLoginScreen(theme=self.tui_settings.resolved_theme),
+            callback=self._handle_custom_provider_login_result,
+        )
+
+    def _handle_custom_provider_login_result(
+        self,
+        result: CustomProviderLoginResult | _LoginFlowAction | None,
+    ) -> None:
+        if result is _LoginFlowAction.BACK:
+            self._open_login_picker()
+            return
+        if result is None:
+            return
+        provider = OpenAICompatibleProviderConfig(
+            name=result.provider_name,
+            base_url=result.base_url.rstrip("/"),
+            api_key_env=result.api_key_env,
+            credential_name=result.provider_name,
+            models=result.models,
+            default_model=result.default_model,
+        )
+        catalog_entry = ProviderCatalogEntry(
+            name=provider.name,
+            display_name=result.display_name,
+            kind="openai-compatible",
+            base_url=provider.base_url,
+            api_key_env=provider.api_key_env,
+            credential_name=provider.credential_name,
+            models=provider.models,
+            default_model=provider.default_model,
+            docs_url=provider.base_url,
+        )
+        try:
+            save_user_catalog_entries((catalog_entry,))
+            FileCredentialStore().set(provider.credential_name or provider.name, result.api_key)
+            settings = load_provider_settings()
+            updated = upsert_openai_compatible_provider(settings, provider, set_default=False)
+            save_provider_settings(updated)
+            self.session.reload_provider_settings()
+            try:
+                self.session.set_provider(provider.name, persist_default=False)
+            except TypeError:
+                self.session.set_provider(provider.name)
+        except Exception as exc:  # noqa: BLE001 - surface login failures in the TUI
+            self._notify(f"Could not save custom provider: {exc}", severity="error")
+            return
+        self._notify(f"Saved custom provider {result.display_name}.")
+        self._refresh()
+
+    def _open_login(self, provider_name: str, *, method: str | None = None) -> None:
         entry = builtin_provider_entry(provider_name)
         if entry is None:
             self._notify(f"Unknown provider: {provider_name}", severity="error")
             return
-        if entry.kind == "openai-codex":
+        use_oauth = method == "subscription" or (
+            method is None and "api_key" not in entry.auth_methods
+        )
+        if use_oauth and get_oauth_provider(entry.name) is not None:
+            login = None
+            if entry.name == "openai-codex":
+
+                async def login(callbacks: OAuthLoginCallbacks) -> OAuthCredential:
+                    return await login_openai_codex(
+                        on_auth=callbacks.on_auth,
+                        on_prompt=callbacks.on_prompt,
+                        on_manual_code_input=callbacks.on_manual_code_input,
+                        on_progress=callbacks.on_progress,
+                    )
+
             self.push_screen(
-                OAuthLoginScreen(entry, theme=self.tui_settings.resolved_theme),
-                callback=lambda credential: self._handle_oauth_login_result(entry, credential),
+                OAuthLoginScreen(
+                    entry,
+                    theme=self.tui_settings.resolved_theme,
+                    login=login,
+                ),
+                callback=lambda credential: self._handle_oauth_login_navigation_result(
+                    entry, credential
+                ),
             )
             return
         self.push_screen(
             LoginScreen(entry, theme=self.tui_settings.resolved_theme),
-            callback=lambda api_key: self._handle_login_result(entry, api_key),
+            callback=lambda api_key: self._handle_api_key_login_navigation_result(entry, api_key),
         )
+
+    def _handle_api_key_login_navigation_result(
+        self,
+        entry: ProviderCatalogEntry,
+        result: str | _LoginFlowAction | None,
+    ) -> None:
+        if result is _LoginFlowAction.BACK:
+            self._open_login_picker()
+        else:
+            self._handle_login_result(entry, result)
 
     def _handle_login_result(self, entry: ProviderCatalogEntry, api_key: str | None) -> None:
         if api_key is None:
+            return
+        if entry.credential_name is None:
+            self._notify(
+                f"Provider {entry.name} does not support saved credentials.",
+                severity="error",
+            )
             return
         try:
             FileCredentialStore().set(entry.credential_name, api_key)
@@ -2639,12 +4455,28 @@ class TauTuiApp(App[None]):
         self._notify(f"Saved login for {entry.display_name}.")
         self._refresh()
 
+    def _handle_oauth_login_navigation_result(
+        self,
+        entry: ProviderCatalogEntry,
+        result: OAuthCredential | _LoginFlowAction | None,
+    ) -> None:
+        if result is _LoginFlowAction.BACK:
+            self._open_login_picker()
+        else:
+            self._handle_oauth_login_result(entry, result)
+
     def _handle_oauth_login_result(
         self,
         entry: ProviderCatalogEntry,
         credential: OAuthCredential | None,
     ) -> None:
         if credential is None:
+            return
+        if entry.credential_name is None:
+            self._notify(
+                f"Provider {entry.name} does not support saved credentials.",
+                severity="error",
+            )
             return
         try:
             FileCredentialStore().set_oauth(entry.credential_name, credential)
@@ -2675,10 +4507,9 @@ class TauTuiApp(App[None]):
             callback=self._handle_logout_provider_result,
         )
 
-    def _handle_logout_provider_result(self, provider_name: str | None) -> None:
-        if provider_name is None:
-            return
-        self._logout(provider_name)
+    def _handle_logout_provider_result(self, provider_name: str | _LoginFlowAction | None) -> None:
+        if isinstance(provider_name, str):
+            self._logout(provider_name)
 
     def _logout(self, provider_name: str) -> None:
         entry = builtin_provider_entry(provider_name)
@@ -2686,6 +4517,9 @@ class TauTuiApp(App[None]):
             self._notify(f"Unknown provider: {provider_name}", severity="error")
             return
 
+        if entry.credential_name is None:
+            self._notify(NO_STORED_CREDENTIALS_MESSAGE, severity="warning")
+            return
         credential_store = FileCredentialStore()
         if not _credential_store_has_entry(credential_store, entry.credential_name):
             self._notify(NO_STORED_CREDENTIALS_MESSAGE, severity="warning")
@@ -2775,7 +4609,7 @@ class TauTuiApp(App[None]):
 
     def _handle_scoped_models_picker_result(self, choice: ModelChoice | None) -> None:
         del choice
-        self._refresh()
+        self._refresh_chrome()
 
     def _handle_model_picker_result(self, choice: ModelChoice | None) -> None:
         if choice is None:
@@ -2791,7 +4625,7 @@ class TauTuiApp(App[None]):
         except Exception as exc:  # noqa: BLE001 - surface model switch failures in the TUI
             self._notify(f"Could not switch model: {exc}", severity="error")
             return
-        self._refresh()
+        self._refresh_chrome()
 
     def _open_theme_picker(self) -> None:
         self.push_screen(
@@ -2819,7 +4653,7 @@ class TauTuiApp(App[None]):
         except Exception as exc:  # noqa: BLE001 - surface session state failures in the TUI
             self._notify(f"Could not change thinking mode: {exc}", severity="error")
             return
-        self._refresh()
+        self._refresh_chrome()
 
     async def _cycle_thinking_level(self) -> None:
         cycler = getattr(self.session, "cycle_thinking_level", None)
@@ -2833,7 +4667,7 @@ class TauTuiApp(App[None]):
         except Exception as exc:  # noqa: BLE001 - surface session state failures in the TUI
             self._notify(f"Could not change thinking mode: {exc}", severity="error")
             return
-        self._refresh()
+        self._refresh_chrome()
 
     async def _cycle_scoped_model(self) -> None:
         cycler = getattr(self.session, "cycle_scoped_model", None)
@@ -2847,7 +4681,7 @@ class TauTuiApp(App[None]):
         except Exception as exc:  # noqa: BLE001 - surface session state failures in the TUI
             self._notify(f"Could not switch scoped model: {exc}", severity="error")
             return
-        self._refresh()
+        self._refresh_chrome()
 
     def _notify(
         self,
@@ -2875,6 +4709,7 @@ class TauTuiApp(App[None]):
     def _refresh_chrome(self, *, theme: TuiTheme | None = None) -> None:
         """Refresh non-transcript chrome without remounting transcript blocks."""
         theme = theme or self.tui_settings.resolved_theme
+        self._sync_header_title()
         self._sync_text_selection_state()
         self._sync_queue_state()
         sidebar = self.query_one("#sidebar", SessionSidebar)
@@ -2894,6 +4729,7 @@ class TauTuiApp(App[None]):
         self.adapter.apply(queue_event())
 
     def _sync_activity_indicator(self) -> None:
+        self._sync_terminal_title()
         if self.state.running:
             if self._activity_timer is None:
                 self._activity_timer = self.set_interval(
@@ -2906,6 +4742,7 @@ class TauTuiApp(App[None]):
             self._apply_activity_indicator()
             return
         self._activity_frame = 0
+        self.state.tool_spinner = None
         if self._activity_timer is not None:
             self._activity_timer.pause()
         self._apply_activity_indicator()
@@ -2915,6 +4752,38 @@ class TauTuiApp(App[None]):
             return
         self._activity_frame += 1
         self._apply_activity_indicator()
+        self._sync_terminal_title()
+        self.state.tool_spinner = TOOL_SPINNER_FRAMES[
+            self._activity_frame % len(TOOL_SPINNER_FRAMES)
+        ]
+        self.call_later(self._respin_pending_tool)
+
+    async def _respin_pending_tool(self) -> None:
+        """Advance the spinner on the tool row that is currently executing."""
+        if not self.state.running:
+            return
+        item = next(
+            (
+                candidate
+                for candidate in reversed(self.state.items)
+                if candidate.role == "tool" and candidate.tool_result_text is None
+            ),
+            None,
+        )
+        if item is None:
+            return
+        try:
+            transcript = self.query_one("#transcript", TranscriptView)
+        except NoMatches:
+            return
+        expanded = self.state.show_tool_results or item.always_show_tool_result
+        await transcript.update_item(
+            item,
+            theme=self.tui_settings.resolved_theme,
+            show_tool_results=expanded,
+            invocation=self.state.resolve_tool_invocation(item),
+            result_markup=self.state.resolve_tool_result(item, expanded=expanded),
+        )
 
     def _apply_activity_indicator(self) -> None:
         theme = self.tui_settings.resolved_theme
@@ -2943,11 +4812,22 @@ class TauTuiApp(App[None]):
     def _refresh_completions(self) -> None:
         suggestions = self.query_one("#autocomplete", Static)
         suggestions.display = bool(self._completion_state.items)
+        if not self._completion_state.items:
+            self._completion_visible_line_budget = None
+            suggestions.update(
+                render_completion_suggestions(
+                    CompletionState(),
+                    theme=self.tui_settings.resolved_theme,
+                )
+            )
+            self._refresh_footer_bindings()
+            return
+        max_lines = self._completion_window_line_budget(suggestions)
         suggestions.update(
             render_completion_suggestions(
                 _visible_completion_state(
                     self._completion_state,
-                    max_lines=_completion_visible_line_limit(suggestions),
+                    max_lines=max_lines,
                     width=max(suggestions.content_size.width or suggestions.size.width, 1),
                 ),
                 theme=self.tui_settings.resolved_theme,
@@ -2955,9 +4835,60 @@ class TauTuiApp(App[None]):
         )
         self._refresh_footer_bindings()
 
+    def _completion_window_line_budget(self, suggestions: Static) -> int:
+        """Return a stable completion window size for the current suggestion box.
+
+        The autocomplete widget has ``height: auto``. If we used its current
+        rendered height as the next render limit unconditionally, selecting an
+        item could render fewer rows, which would shrink the widget, which would
+        then make the next render limit smaller again. Keep the largest measured
+        height for the current completion session so navigation does not feed
+        back into progressively smaller boxes.
+        """
+        measured_limit = _completion_visible_line_limit(suggestions)
+        if suggestions.size.height <= 0:
+            if self._completion_visible_line_budget is None:
+                self._completion_visible_line_budget = self._initial_completion_line_budget()
+            return self._completion_visible_line_budget
+        self._completion_visible_line_budget = max(
+            self._completion_visible_line_budget or measured_limit,
+            measured_limit,
+        )
+        return self._completion_visible_line_budget
+
+    def _initial_completion_line_budget(self) -> int:
+        """Estimate the first completion window size before Textual lays it out."""
+        terminal_height = self.size.height
+        if terminal_height <= 0:
+            return COMPLETION_MAX_VISIBLE_LINES
+
+        reserved_rows = COMPLETION_MIN_TRANSCRIPT_LINES + COMPLETION_WIDGET_CHROME_LINES
+        reserved_rows += 2  # Header and footer.
+        for selector in ("#prompt-row", "#compact-session-info", "#queued-messages"):
+            with suppress(NoMatches):
+                widget = self.query_one(selector)
+                if widget.display:
+                    reserved_rows += widget.outer_size.height
+
+        available_rows = terminal_height - reserved_rows
+        terminal_fraction_rows = max(1, terminal_height // COMPLETION_INITIAL_TERMINAL_FRACTION)
+        return max(
+            1,
+            min(COMPLETION_MAX_VISIBLE_LINES, available_rows, terminal_fraction_rows),
+        )
+
     def _update_responsive_layout(self, width: int, height: int) -> None:
+        if self.tui_settings.sidebar_position == "off":
+            return
         show_sidebar = width >= SIDEBAR_MIN_WIDTH and height >= SIDEBAR_MIN_HEIGHT
         self.set_class(not show_sidebar, "-hide-sidebar")
+
+    def _apply_sidebar_position(self) -> None:
+        """Apply CSS classes for the configured sidebar position."""
+        pos = self.tui_settings.sidebar_position
+        self.set_class(pos == "right", "-sidebar-right")
+        if pos == "off":
+            self.add_class("-hide-sidebar")
 
     def _build_completion_state(self, text: str) -> CompletionState:
         registry = _session_command_registry(self.session)
@@ -2967,7 +4898,10 @@ class TauTuiApp(App[None]):
             skills=self.session.skills,
             prompt_templates=self.session.prompt_templates,
             model_names=self.session.available_models,
-            provider_names=self.session.available_providers,
+            provider_names=(
+                *self.session.available_providers,
+                *LOGIN_PROVIDER_ALIASES,
+            ),
             thinking_levels=getattr(self.session, "available_thinking_levels", ()),
             theme_names=BUILTIN_TUI_THEME_NAMES,
             session_options=_session_options(self.session),
@@ -3042,6 +4976,17 @@ def _render_activity_indicator(theme: TuiTheme, *, frame: int, running: bool) ->
 def _is_terminal_command_prompt(text: str) -> bool:
     """Return whether the prompt is currently in terminal-command mode."""
     return _terminal_command_prefix_span(text) is not None
+
+
+def _should_optimistically_render_prompt(text: str) -> bool:
+    """Return whether submitted text can be safely shown before session expansion."""
+    stripped = text.strip()
+    return bool(stripped) and not stripped.startswith("/")
+
+
+def _is_user_message_end_event(event: AgentEvent) -> bool:
+    """Return whether an agent event closes a user message."""
+    return isinstance(event, MessageEndEvent) and isinstance(event.message, UserMessage)
 
 
 def _terminal_command_prefix_span(text: str) -> tuple[int, int] | None:
@@ -3284,20 +5229,27 @@ def _named_session_title(title: str | None) -> str | None:
     return stripped
 
 
+def _session_header_sub_title(session: CodingSession) -> str:
+    """Return the session label shown beside Tau in the TUI header."""
+    title = _named_session_title(getattr(session, "session_title", None))
+    return title or "Untitled session"
+
+
 def _login_provider_label(provider: ProviderCatalogEntry) -> str:
-    return f"{provider.display_name}\n  {provider.name}"
+    return f"{provider.display_name} — {provider.name}"
 
 
 def _subscription_login_providers(
     providers: Sequence[ProviderCatalogEntry],
 ) -> tuple[ProviderCatalogEntry, ...]:
-    return tuple(provider for provider in providers if provider.kind == "openai-codex")
+    provider_ids = oauth_provider_ids()
+    return tuple(provider for provider in providers if provider.name in provider_ids)
 
 
 def _api_key_login_providers(
     providers: Sequence[ProviderCatalogEntry],
 ) -> tuple[ProviderCatalogEntry, ...]:
-    return tuple(provider for provider in providers if provider.kind != "openai-codex")
+    return tuple(provider for provider in providers if "api_key" in provider.auth_methods)
 
 
 def _stored_credential_providers(
@@ -3307,7 +5259,8 @@ def _stored_credential_providers(
     return tuple(
         provider
         for provider in providers
-        if _credential_store_has_entry(credential_store, provider.credential_name)
+        if provider.credential_name is not None
+        and _credential_store_has_entry(credential_store, provider.credential_name)
     )
 
 
@@ -3340,6 +5293,20 @@ def _model_picker_label(
     )
     suffix = " [scoped]" if scoped else ""
     return f"{marker}{choice.provider_name}:{choice.model}{suffix}"
+
+
+def _filter_login_providers(
+    providers: Sequence[ProviderCatalogEntry],
+    query: str,
+) -> tuple[ProviderCatalogEntry, ...]:
+    normalized = query.strip().casefold()
+    if not normalized:
+        return tuple(providers)
+    return tuple(
+        provider
+        for provider in providers
+        if normalized in provider.name.casefold() or normalized in provider.display_name.casefold()
+    )
 
 
 def _filter_model_choices(choices: Sequence[ModelChoice], query: str) -> tuple[ModelChoice, ...]:
@@ -3376,7 +5343,28 @@ def _is_thinking_cycle_key(key: str, configured_key: str) -> bool:
     return configured_key == "shift+tab" and key == "backtab"
 
 
+def _textual_theme_for_tau_theme(theme_name: TuiThemeName) -> Theme:
+    """Map a Tau theme to Textual's native theme type."""
+    theme = TuiSettings(theme=theme_name).resolved_theme
+    return Theme(
+        name=theme.name,
+        primary=theme.accent,
+        secondary=theme.prompt_border,
+        warning=theme.markdown_bullet,
+        error=theme.role_styles["error"].border,
+        success=theme.role_styles["assistant"].border,
+        accent=theme.accent,
+        foreground=theme.screen_text,
+        background=theme.screen_background,
+        surface=theme.chrome_background,
+        panel=theme.sidebar_background,
+        dark=theme.name != "tau-light",
+        variables=_theme_css_variables(theme),
+    )
+
+
 def _theme_css_variables(theme: TuiTheme) -> dict[str, str]:
+    """Return Textual CSS variables for a resolved Tau theme."""
     return {
         "tau-screen-background": theme.screen_background,
         "tau-screen-text": theme.screen_text,
@@ -3692,9 +5680,13 @@ def _selection_from_session_record(settings: Any, record: Any | None) -> Provide
                 model=choice.model,
             )
 
+    credential_store = FileCredentialStore()
     for provider in settings.providers:
-        if record_model in provider.models:
-            return ProviderSelection(provider=provider, model=record_model)
+        if record_model not in provider.models:
+            continue
+        if not provider_has_usable_credentials(provider, credential_reader=credential_store):
+            continue
+        return ProviderSelection(provider=provider, model=record_model)
     return None
 
 
@@ -3725,6 +5717,10 @@ async def run_tui_app(
     initial_prompt: str | None = None,
     session_manager: SessionManager | None = None,
     startup_notice: str | None = None,
+    startup_notices: Sequence[str] = (),
+    extension_paths: tuple[Path, ...] = (),
+    extensions_enabled: bool = True,
+    project_extensions_enabled: bool = False,
 ) -> None:
     """Create the default provider/session and run the Textual app."""
     if new_session and session_id is not None:
@@ -3785,13 +5781,18 @@ async def run_tui_app(
                 auto_compact_token_threshold=auto_compact_token_threshold,
                 index_on_first_persist=index_on_first_persist,
                 shell_command_prefix=shell_settings.shell_command_prefix,
+                extension_paths=extension_paths,
+                extensions_enabled=extensions_enabled,
+                project_extensions_enabled=project_extensions_enabled,
             )
         )
+        legacy_notices = (startup_notice,) if startup_notice else ()
+        all_startup_notices = tuple((*startup_notices, *legacy_notices))
         app = TauTuiApp(
             session,
             tui_settings=load_tui_settings(),
             startup_message=startup_message,
-            startup_notice=startup_notice,
+            startup_notices=all_startup_notices,
             initial_prompt=initial_prompt,
         )
         await app.run_async()

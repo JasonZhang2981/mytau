@@ -1,5 +1,7 @@
 """OpenAI Codex subscription Responses provider."""
 
+from __future__ import annotations
+
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from json import JSONDecodeError, dumps, loads
@@ -8,7 +10,13 @@ from typing import Any
 
 import httpx
 
-from tau_agent.messages import AgentMessage, AssistantMessage, ToolResultMessage, UserMessage
+from tau_agent.messages import (
+    AgentMessage,
+    AssistantMessage,
+    ToolResultMessage,
+    Usage,
+    UserMessage,
+)
 from tau_agent.tools import AgentTool, ToolCall
 from tau_agent.types import JSONValue
 from tau_ai.env import (
@@ -25,6 +33,8 @@ from tau_ai.events import (
     ProviderThinkingDeltaEvent,
     ProviderToolCallEvent,
 )
+from tau_ai.http import create_async_client
+from tau_ai.http_errors import provider_http_error_message
 from tau_ai.provider import CancellationToken
 from tau_ai.retry import provider_retry_event, retry_delay_seconds, wait_for_retry
 
@@ -55,6 +65,7 @@ class OpenAICodexConfig:
     originator: str = "tau"
     reasoning_effort: str | None = None
     reasoning_summary: str = "auto"
+    provider_name: str = "OpenAI Codex"
 
 
 class OpenAICodexProvider:
@@ -143,9 +154,11 @@ class OpenAICodexProvider:
                                     return
                                 continue
                             yield ProviderErrorEvent(
-                                message=_codex_http_error_message(
+                                message=provider_http_error_message(
+                                    provider_name=self._config.provider_name,
                                     status_code=response.status_code,
                                     body=body_text,
+                                    model=model,
                                 ),
                                 data={
                                     "status_code": response.status_code,
@@ -197,7 +210,7 @@ class OpenAICodexProvider:
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=self._config.timeout_seconds)
+            self._client = create_async_client(timeout=self._config.timeout_seconds)
         return self._client
 
     def _should_retry(
@@ -357,6 +370,7 @@ async def _codex_provider_events(
     tools_by_call_id: dict[str, _ToolCallBuilder] = {}
     tools_by_output_index: dict[int, _ToolCallBuilder] = {}
     finish_reason: str | None = None
+    usage: Usage | None = None
 
     async for event in _iter_sse_objects(response):
         if signal is not None and signal.is_cancelled():
@@ -480,10 +494,15 @@ async def _codex_provider_events(
             "response.incomplete",
         }:
             finish_reason = _finish_reason_from_response(event)
+            usage = _usage_from_response(event) or usage
             break
 
     yield ProviderResponseEndEvent(
-        message=AssistantMessage(content="".join(content_parts), tool_calls=tool_calls),
+        message=AssistantMessage(
+            content="".join(content_parts),
+            tool_calls=tool_calls,
+            usage=usage,
+        ),
         finish_reason=finish_reason,
     )
 
@@ -645,41 +664,46 @@ def _finish_reason_from_response(event: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _codex_http_error_message(*, status_code: int, body: str) -> str:
-    prefix = f"OpenAI Codex request failed with status {status_code}"
-    detail = _http_error_detail(body)
-    if detail:
-        return f"{prefix}: {detail}"
-    return prefix
+def _int_or_zero(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
-def _http_error_detail(body: str) -> str:
-    parsed = _loads_object(body)
-    if parsed is not None:
-        detail = _error_detail_from_mapping(parsed)
-        if detail:
-            return detail
-    return body.strip()[:1000]
+def _usage_from_response(event: Mapping[str, Any]) -> Usage | None:
+    """Parse billed usage from a Responses ``response.completed``-style event.
 
-
-def _error_detail_from_mapping(value: Mapping[str, Any]) -> str:
-    error = value.get("error")
-    if isinstance(error, Mapping):
-        message = error.get("message")
-        if isinstance(message, str) and message:
-            return message
-        code = error.get("code")
-        if isinstance(code, str) and code:
-            return code
-    for key in ("message", "detail", "error"):
-        detail = value.get(key)
-        if isinstance(detail, str) and detail:
-            return detail
-        if isinstance(detail, Mapping):
-            nested = _error_detail_from_mapping(detail)
-            if nested:
-                return nested
-    return ""
+    Ports Pi's openai-responses-shared.ts usage handling: ``cached_tokens`` are
+    cache reads and are subtracted from ``input_tokens`` to leave fresh input.
+    The Responses API does not report cache writes, so ``cache_write`` stays 0.
+    Cost is left unset (None) because Tau has no per-model pricing table.
+    """
+    response = event.get("response")
+    if not isinstance(response, Mapping):
+        return None
+    raw = response.get("usage")
+    if not isinstance(raw, Mapping):
+        return None
+    input_details = raw.get("input_tokens_details")
+    cache_read = (
+        _int_or_zero(input_details.get("cached_tokens"))
+        if isinstance(input_details, Mapping)
+        else 0
+    )
+    output_details = raw.get("output_tokens_details")
+    # Leave reasoning None (not 0) when the provider reports no breakdown,
+    # honoring the "None = not reported" contract on Usage.
+    reasoning = (
+        _int_or_zero(output_details.get("reasoning_tokens"))
+        if isinstance(output_details, Mapping)
+        else None
+    )
+    return Usage(
+        input=max(0, _int_or_zero(raw.get("input_tokens")) - cache_read),
+        output=_int_or_zero(raw.get("output_tokens")),
+        cache_read=cache_read,
+        cache_write=0,
+        reasoning=reasoning,
+        total_tokens=_int_or_zero(raw.get("total_tokens")),
+    )
 
 
 def _response_error_message(event: Mapping[str, Any]) -> str:

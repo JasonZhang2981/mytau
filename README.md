@@ -15,7 +15,7 @@
   ·
   <a href="https://pypi.org/project/tau-ai/">PyPI</a>
   ·
-  <a href="https://github.com/alejandro-ao/tau/issues/1">Roadmap</a>
+  <a href="https://github.com/huggingface/tau/issues/1">Roadmap</a>
 </p>
 
 ---
@@ -55,13 +55,22 @@ or rendering. Frontends consume events.
 ## Install
 
 Tau is published on PyPI as `tau-ai` and installs a `tau` command.
+It requires Python 3.12 or newer.
 
 ```bash
 uv tool install tau-ai
 tau --version
 ```
 
-Don't have `uv`?
+Don't have `uv`? Install with `pipx` or `pip` instead:
+
+```bash
+pipx install tau-ai
+# or
+python -m pip install tau-ai
+```
+
+If you prefer `uv`, install it with:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -70,11 +79,23 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 For local development:
 
 ```bash
-git clone https://github.com/alejandro-ao/tau.git
+git clone https://github.com/huggingface/tau.git
 cd tau
 uv sync --dev
 uv run tau --version
 ```
+
+To make the checkout-backed command available globally, install it as an
+editable tool:
+
+```bash
+uv tool install --editable --force .
+```
+
+Run that command again after `git pull`. Editable installs expose source-code
+changes immediately, but the tool environment's package metadata, dependencies,
+and entry points are only refreshed when uv reinstalls the tool. Without the
+refresh, `tau --version` can still show the version from the previous install.
 
 ## Quickstart
 
@@ -114,6 +135,10 @@ tau
 Tau ships with support for OpenAI, Anthropic, OpenAI Codex subscription auth,
 OpenRouter, Hugging Face, and custom OpenAI-compatible endpoints, including local
 models. See the [providers guide](https://twotimespi.dev/guides/providers-and-models/).
+
+The built-in catalog lives in `src/tau_coding/data/catalog.toml`; add your own
+providers and models by dropping a `~/.tau/catalog.toml` with the same schema —
+no code changes required.
 
 ## What Tau can do
 
@@ -184,20 +209,19 @@ uv run tau
 uv run tau -p "explain this repo"
 ```
 
-Run the Astro/Starlight documentation site:
+Run the Hugo documentation site:
 
 ```bash
 cd website
-bun install
-bun run dev
+hugo server -D
 ```
 
-Open <http://localhost:4321/>. Build with `bun run build`.
+Open <http://localhost:1313/>. Build with `hugo --minify`.
 
 ## Documentation
 
 User docs are published at <https://twotimespi.dev/> and live in
-`website/src/content/docs/`.
+`website/content/`.
 
 Useful entry points:
 
@@ -209,7 +233,7 @@ Useful entry points:
 - [CLI reference](https://twotimespi.dev/reference/cli/)
 
 Tau is under active development. The implementation roadmap is tracked in
-[GitHub issue #1](https://github.com/alejandro-ao/tau/issues/1).
+[GitHub issue #1](https://github.com/huggingface/tau/issues/1).
 
 ## License
 

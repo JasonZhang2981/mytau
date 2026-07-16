@@ -1,15 +1,22 @@
 """Runtime provider construction for Tau coding sessions."""
 
+from __future__ import annotations
+
+from dataclasses import replace
 from os import environ
 from typing import Protocol
 
 from tau_ai import (
+    AnthropicConfig,
     AnthropicProvider,
+    GoogleGenerativeAIProvider,
+    MistralConversationsProvider,
     ModelProvider,
     OpenAICodexConfig,
     OpenAICodexCredentials,
     OpenAICodexProvider,
     OpenAICompatibleProvider,
+    RuntimeProviderAuth,
 )
 from tau_coding.credentials import FileCredentialStore, OAuthCredential
 from tau_coding.oauth import (
@@ -17,14 +24,18 @@ from tau_coding.oauth import (
     oauth_credential_is_expired,
     refresh_openai_codex_token,
 )
+from tau_coding.oauth_registry import get_oauth_provider
+from tau_coding.oauth_types import OAuthProvider
 from tau_coding.provider_config import (
     AnthropicProviderConfig,
     OpenAICodexProviderConfig,
+    OpenAICompatibleProviderConfig,
     ProviderConfig,
     ProviderConfigError,
     anthropic_config_from_provider,
     openai_compatible_config_from_provider,
     provider_thinking_levels,
+    validate_provider_model,
 )
 from tau_coding.thinking import ThinkingLevel, normalize_thinking_level, reasoning_effort_for_level
 
@@ -45,15 +56,31 @@ def create_model_provider(
     thinking_level: ThinkingLevel | None = None,
 ) -> ClosableModelProvider:
     """Create a runtime model provider from durable provider settings."""
+    if model is not None:
+        validate_provider_model(provider, model)
     credentials = credential_store or FileCredentialStore()
     if isinstance(provider, AnthropicProviderConfig):
-        return AnthropicProvider(
-            anthropic_config_from_provider(
-                provider,
-                credential_reader=credentials,
-                thinking_level=thinking_level,
-            )
+        credential = _oauth_credential(provider, credentials)
+        config = anthropic_config_from_provider(
+            provider,
+            credential_reader=credentials,
+            model=model,
+            thinking_level=thinking_level,
         )
+        if credential is not None:
+            runtime_auth = _required_oauth_provider(provider.name).runtime_auth(credential)
+            config = replace(
+                config,
+                api_key=runtime_auth.api_key,
+                bearer_auth=True,
+                headers={**dict(config.headers or {}), **dict(runtime_auth.headers or {})},
+                oauth_system_prompt="You are Claude Code, Anthropic's official CLI for Claude.",
+                credential_resolver=OAuthRuntimeCredentialResolver(
+                    provider,
+                    credential_store=credentials,
+                ),
+            )
+        return AnthropicProvider(config)
     if isinstance(provider, OpenAICodexProviderConfig):
         return OpenAICodexProvider(
             OpenAICodexConfig(
@@ -62,6 +89,7 @@ def create_model_provider(
                     credential_store=credentials,
                 ),
                 base_url=provider.base_url,
+                provider_name=provider.name,
                 headers=provider.headers,
                 timeout_seconds=provider.timeout_seconds,
                 max_retries=provider.max_retries,
@@ -73,14 +101,53 @@ def create_model_provider(
                 ),
             )
         )
-    return OpenAICompatibleProvider(
-        openai_compatible_config_from_provider(
+    if isinstance(provider, OpenAICompatibleProviderConfig):
+        credential = _oauth_credential(provider, credentials)
+        compatible_config = openai_compatible_config_from_provider(
             provider,
             credential_reader=credentials,
             model=model,
             thinking_level=thinking_level,
         )
-    )
+        if credential is not None:
+            runtime_auth = _required_oauth_provider(provider.name).runtime_auth(credential)
+            compatible_config = replace(
+                compatible_config,
+                api_key=runtime_auth.api_key,
+                base_url=runtime_auth.base_url or compatible_config.base_url,
+                headers={
+                    **dict(compatible_config.headers or {}),
+                    **dict(runtime_auth.headers or {}),
+                },
+                credential_resolver=OAuthRuntimeCredentialResolver(
+                    provider,
+                    credential_store=credentials,
+                ),
+            )
+        selected_api = compatible_config.api
+        if selected_api == "anthropic-messages":
+            if credential is None:
+                raise ProviderConfigError(
+                    "Anthropic-protocol models on openai-compatible providers require OAuth"
+                )
+            anthropic_config = AnthropicConfig(
+                api_key=compatible_config.api_key,
+                base_url=compatible_config.base_url,
+                headers=compatible_config.headers,
+                timeout_seconds=compatible_config.timeout_seconds,
+                max_retries=compatible_config.max_retries,
+                max_retry_delay_seconds=compatible_config.max_retry_delay_seconds,
+                provider_name=compatible_config.provider_name,
+                bearer_auth=True,
+                credential_resolver=compatible_config.credential_resolver,
+            )
+            return AnthropicProvider(anthropic_config)
+        if selected_api == "google-generative-ai":
+            return GoogleGenerativeAIProvider(compatible_config)
+        if selected_api == "mistral-conversations":
+            return MistralConversationsProvider(compatible_config)
+        return OpenAICompatibleProvider(compatible_config)
+    raise ProviderConfigError(f"Unsupported provider config: {provider.name}")
 
 
 def _codex_reasoning_effort(
@@ -128,6 +195,8 @@ class OpenAICodexCredentialResolver:
             credential = self._credential_store.get_oauth(credential_name)
             if credential is not None:
                 credential = await self._refresh_if_needed(credential_name, credential)
+                if credential.account_id is None:
+                    raise RuntimeError("OpenAI Codex OAuth credential is missing account_id")
                 return OpenAICodexCredentials(
                     access_token=credential.access,
                     account_id=credential.account_id,
@@ -153,5 +222,56 @@ class OpenAICodexCredentialResolver:
         if not oauth_credential_is_expired(credential):
             return credential
         refreshed = await refresh_openai_codex_token(credential.refresh)
-        self._credential_store.set_oauth(credential_name, refreshed)
+        if refreshed != credential:
+            self._credential_store.set_oauth(credential_name, refreshed)
         return refreshed
+
+
+def _oauth_credential(
+    provider: ProviderConfig,
+    credential_store: FileCredentialStore,
+) -> OAuthCredential | None:
+    if provider.credential_name is None or get_oauth_provider(provider.name) is None:
+        return None
+    return credential_store.get_oauth(provider.credential_name)
+
+
+class OAuthRuntimeCredentialResolver:
+    """Refresh provider-neutral OAuth credentials immediately before a request."""
+
+    def __init__(
+        self,
+        provider: ProviderConfig,
+        *,
+        credential_store: FileCredentialStore,
+    ) -> None:
+        self._provider = provider
+        self._credential_store = credential_store
+
+    async def __call__(self) -> RuntimeProviderAuth:
+        credential_name = self._provider.credential_name
+        if credential_name is None:
+            raise RuntimeError(f"Provider {self._provider.name} has no credential name")
+        credential = self._credential_store.get_oauth(credential_name)
+        if credential is None:
+            raise RuntimeError(
+                f"Missing OAuth credentials for {self._provider.name}. "
+                f"Run /login {self._provider.name}."
+            )
+        oauth_provider = _required_oauth_provider(self._provider.name)
+        refreshed = await oauth_provider.refresh(credential)
+        if refreshed != credential:
+            self._credential_store.set_oauth(credential_name, refreshed)
+        auth = oauth_provider.runtime_auth(refreshed)
+        return RuntimeProviderAuth(
+            api_key=auth.api_key,
+            base_url=auth.base_url,
+            headers=auth.headers,
+        )
+
+
+def _required_oauth_provider(provider_name: str) -> OAuthProvider:
+    oauth_provider = get_oauth_provider(provider_name)
+    if oauth_provider is None:
+        raise RuntimeError(f"No OAuth implementation is registered for {provider_name}")
+    return oauth_provider

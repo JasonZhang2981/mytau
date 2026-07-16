@@ -1,5 +1,7 @@
 """Durable Textual TUI configuration for Tau."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from json import dumps, loads
 from pathlib import Path
@@ -130,6 +132,7 @@ TAU_DARK_THEME = TuiTheme(
         "status": TuiRoleStyle(border="#526070", body="#aab4c2 on #000000"),
         "thinking": TuiRoleStyle(border="#4b5563", body="#9ca3af on #000000"),
         "skill": TuiRoleStyle(border="#b48ead", body="#e5d4ef on #000000"),
+        "custom": TuiRoleStyle(border="#6ea6a0", body="#d8dee9 on #000000"),
         "branch_summary": TuiRoleStyle(border="#c084fc", body="#e9d5ff on #000000"),
         "compaction_summary": TuiRoleStyle(border="#c084fc", body="#e9d5ff on #000000"),
     },
@@ -172,6 +175,7 @@ HIGH_CONTRAST_THEME = TuiTheme(
         "status": TuiRoleStyle(border="#ffffff", body="white on #111111"),
         "thinking": TuiRoleStyle(border="#00b7ff", body="white on #001626"),
         "skill": TuiRoleStyle(border="#ff8cff", body="white on #260026"),
+        "custom": TuiRoleStyle(border="#00ffcc", body="white on #001a17"),
         "branch_summary": TuiRoleStyle(border="#d8b4fe", body="white on #260026"),
         "compaction_summary": TuiRoleStyle(border="#d8b4fe", body="white on #260026"),
     },
@@ -214,6 +218,7 @@ TAU_LIGHT_THEME = TuiTheme(
         "status": TuiRoleStyle(border="#64748b", body="#334155"),
         "thinking": TuiRoleStyle(border="#6b7280", body="#4b5563"),
         "skill": TuiRoleStyle(border="#7c3aed", body="#4c1d95"),
+        "custom": TuiRoleStyle(border="#0f766e", body="#111827"),
         "branch_summary": TuiRoleStyle(border="#9333ea", body="#581c87"),
         "compaction_summary": TuiRoleStyle(border="#9333ea", body="#581c87"),
     },
@@ -240,12 +245,14 @@ class TuiSettings:
     keybindings: TuiKeybindings = field(default_factory=TuiKeybindings)
     theme: TuiThemeName = "tau-dark"
     auto_copy_selection: bool = False
+    sidebar_position: Literal["left", "right", "off"] = "left"
 
     def to_json(self) -> dict[str, Any]:
         """Serialize these settings to JSON-compatible data."""
         return {
             "auto_copy_selection": self.auto_copy_selection,
             "keybindings": self.keybindings.to_json(),
+            "sidebar_position": self.sidebar_position,
             "theme": self.theme,
         }
 
@@ -281,7 +288,7 @@ def save_tui_settings(settings: TuiSettings, paths: TauPaths | None = None) -> P
 
 def tui_settings_from_json(data: dict[str, Any]) -> TuiSettings:
     """Parse TUI settings from JSON-compatible data."""
-    allowed_fields = {"auto_copy_selection", "keybindings", "theme"}
+    allowed_fields = {"auto_copy_selection", "keybindings", "sidebar_position", "theme"}
     unknown_fields = set(data) - allowed_fields
     if unknown_fields:
         raise TuiConfigError(f"Unknown TUI settings field: {sorted(unknown_fields)[0]}")
@@ -289,6 +296,9 @@ def tui_settings_from_json(data: dict[str, Any]) -> TuiSettings:
     keybindings_data = data.get("keybindings", {})
     if not isinstance(keybindings_data, dict):
         raise TuiConfigError("TUI keybindings must be a JSON object")
+    raw_sidebar = data.get("sidebar_position", "left")
+    if not isinstance(raw_sidebar, str) or raw_sidebar not in {"left", "right", "off"}:
+        raise TuiConfigError("sidebar_position must be 'left', 'right', or 'off'")
     return TuiSettings(
         keybindings=_keybindings_from_json(keybindings_data),
         theme=_theme_name(data.get("theme", "tau-dark")),
@@ -296,6 +306,7 @@ def tui_settings_from_json(data: dict[str, Any]) -> TuiSettings:
             data.get("auto_copy_selection", False),
             "auto_copy_selection",
         ),
+        sidebar_position=cast(Literal["left", "right", "off"], raw_sidebar),
     )
 
 

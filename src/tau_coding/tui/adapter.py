@@ -1,5 +1,7 @@
 """Translate agent events into Textual TUI display state."""
 
+from __future__ import annotations
+
 from tau_agent import (
     AgentEndEvent,
     AgentEvent,
@@ -55,7 +57,11 @@ class TuiEventAdapter:
 
         if isinstance(event, MessageEndEvent):
             if event.message.role == "user":
-                self.state.add_user_message(event.message.content)
+                self.state.add_user_message(
+                    event.message.content,
+                    custom_type=event.message.custom_type,
+                    details=event.message.details,
+                )
                 return
             if event.message.role == "tool":
                 return
@@ -71,7 +77,7 @@ class TuiEventAdapter:
             return
 
         if isinstance(event, ToolExecutionUpdateEvent):
-            self.state.add_item("tool", f"… {event.message}")
+            self.state.record_tool_update(event.tool_call_id, event.message)
             return
 
         if isinstance(event, RetryEvent):

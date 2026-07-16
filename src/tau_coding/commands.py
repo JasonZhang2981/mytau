@@ -1,5 +1,7 @@
 """Slash command registry for Tau coding sessions."""
 
+from __future__ import annotations
+
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +18,10 @@ from tau_coding.system_prompt import ProjectContextFile
 from tau_coding.thinking import normalize_thinking_level
 
 BUILTIN_TUI_THEME_NAMES = ("tau-dark", "tau-light", "high-contrast")
+LOGIN_PROVIDER_ALIASES = {
+    "anthropic-api": ("anthropic", "api-key"),
+    "anthropic-subscription": ("anthropic", "subscription"),
+}
 
 
 class CommandSession(Protocol):
@@ -78,9 +84,9 @@ class CommandSession(Protocol):
     @property
     def session_manager(self) -> SessionManager | None: ...
 
-    def set_model(self, model: str) -> None: ...
+    def ensure_session_indexed(self) -> None: ...
 
-    def reload(self) -> CodingReloadSummary: ...
+    def set_model(self, model: str) -> None: ...
 
     def reload_provider_settings(self) -> None: ...
 
@@ -92,6 +98,7 @@ class CommandResult:
     handled: bool
     exit_requested: bool = False
     clear_requested: bool = False
+    reload_requested: bool = False
     new_session_requested: bool = False
     compact_summary: str | None = None
     export_requested: bool = False
@@ -101,7 +108,9 @@ class CommandResult:
     resume_picker_requested: bool = False
     tree_picker_requested: bool = False
     login_picker_requested: bool = False
+    custom_provider_login_requested: bool = False
     login_provider: str | None = None
+    login_method: str | None = None
     logout_picker_requested: bool = False
     logout_provider: str | None = None
     model_picker_requested: bool = False
@@ -186,7 +195,7 @@ class CommandRegistry:
             name = "scoped-models"
             args = ""
         if command is None:
-            return CommandResult(handled=True, message=f"Unknown command: /{name}")
+            return CommandResult(handled=False)
 
         return command.handler(
             CommandContext(session=session, registry=self, text=stripped, name=name, args=args)
@@ -331,7 +340,7 @@ def create_default_command_registry() -> CommandRegistry:
         SlashCommand(
             name="login",
             usage="/login [provider]",
-            description="Save an API key for a built-in provider.",
+            description="Connect a provider with OAuth or an API key.",
             handler=_login_command,
         )
     )
@@ -471,15 +480,9 @@ def _resources_command(context: CommandContext) -> CommandResult:
 
 
 def _reload_command(context: CommandContext) -> CommandResult:
-    try:
-        summary = context.session.reload()
-    except ValueError as exc:
-        return CommandResult(handled=True, message=f"Could not reload: {exc}")
-
-    return CommandResult(
-        handled=True,
-        message=_format_reload_summary(summary),
-    )
+    # Reload owns async extension lifecycle hooks, so frontends execute it from
+    # their async command path rather than inside this synchronous registry.
+    return CommandResult(handled=True, reload_requested=True)
 
 
 def _context_command(context: CommandContext) -> CommandResult:
@@ -533,12 +536,11 @@ def _name_command(context: CommandContext) -> CommandResult:
     if manager is None or session_id is None:
         return CommandResult(handled=True, message="Session manager is not available.")
 
-    record = manager.get_session(session_id)
-    if record is None:
-        return CommandResult(handled=True, message=f"Unknown current session: {session_id}")
-
     if not context.args:
-        title = record.title or "Untitled session"
+        record = manager.get_session(session_id)
+        title = (
+            record.title if record is not None else context.session.session_title
+        ) or "Untitled session"
         return CommandResult(
             handled=True,
             message=f"Current session name: {title}\nUsage: /name <new name>",
@@ -548,6 +550,9 @@ def _name_command(context: CommandContext) -> CommandResult:
         name = _validated_session_name(context.args)
     except ValueError as exc:
         return CommandResult(handled=True, message=str(exc))
+
+    if manager.get_session(session_id) is None:
+        context.session.ensure_session_indexed()
 
     updated = manager.touch_session(
         session_id,
@@ -674,17 +679,33 @@ def _theme_command(context: CommandContext) -> CommandResult:
 
 def _login_command(context: CommandContext) -> CommandResult:
     provider_name = context.args.strip()
+    if provider_name in {"custom", "new", "add"}:
+        return CommandResult(handled=True, custom_provider_login_requested=True)
     if provider_name:
+        aliased_provider = LOGIN_PROVIDER_ALIASES.get(provider_name)
+        if aliased_provider is not None:
+            provider_name, login_method = aliased_provider
+        else:
+            login_method = None
         entry = builtin_provider_entry(provider_name)
         if entry is None:
-            providers = ", ".join(entry.name for entry in BUILTIN_PROVIDER_CATALOG)
+            providers = ", ".join(
+                [
+                    *(entry.name for entry in BUILTIN_PROVIDER_CATALOG),
+                    *LOGIN_PROVIDER_ALIASES,
+                ]
+            )
             return CommandResult(
                 handled=True,
                 message=(
                     f"Unknown login provider: {provider_name}\nAvailable providers: {providers}"
                 ),
             )
-        return CommandResult(handled=True, login_provider=entry.name)
+        return CommandResult(
+            handled=True,
+            login_provider=entry.name,
+            login_method=login_method,
+        )
 
     return CommandResult(handled=True, login_picker_requested=True)
 
@@ -733,12 +754,13 @@ def _refresh_provider_settings(session: CommandSession) -> CommandResult | None:
     return None
 
 
-def _format_reload_summary(summary: CodingReloadSummary) -> str:
+def format_reload_summary(summary: CodingReloadSummary) -> str:
     lines = [
         "Reloaded local coding resources and project context.",
         "Resources:",
         f"- Skills: {_format_reload_category(summary.skills)}",
         f"- Prompt templates: {_format_reload_category(summary.prompt_templates)}",
+        f"- Extensions: {_format_reload_category(summary.extensions)}",
         "Context:",
         f"- Project context files: {_format_reload_category(summary.context_files)}",
         "- Next-turn system prompt: "

@@ -1,13 +1,15 @@
 """Small Textual widgets for Tau's interactive TUI."""
 
+from __future__ import annotations
+
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from subprocess import TimeoutExpired, run
-from typing import Any, ClassVar, Protocol
+from typing import Any, ClassVar, Literal, Protocol
 
-from pygments.lexers import get_lexer_by_name  # type: ignore[import-untyped]
-from pygments.util import ClassNotFound  # type: ignore[import-untyped]
+from pygments.lexers import get_lexer_by_name
+from pygments.util import ClassNotFound
 from rich.align import Align
 from rich.console import Console, Group, RenderableType
 from rich.markdown import CodeBlock, Heading, Markdown
@@ -19,10 +21,12 @@ from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
 from textual.containers import Horizontal, VerticalScroll
-from textual.content import Style as TextualStyle
+from textual.content import Style as TextualStyle  # type: ignore[attr-defined]
+from textual.css.query import NoMatches
 from textual.events import Resize
 from textual.geometry import Offset
 from textual.selection import Selection
+from textual.widget import Widget
 from textual.widgets import Markdown as TextualMarkdown
 from textual.widgets import Static
 from textual.widgets.markdown import MarkdownBlock, MarkdownStream
@@ -108,12 +112,6 @@ class CompactSessionInfo(Static):
         self.update(render_compact_session_info(session, theme=theme))
 
 
-class NonSelectableStatic(Static):
-    """Static display text that should not participate in mouse selection."""
-
-    ALLOW_SELECT = False
-
-
 class TauMarkdownBlock(MarkdownBlock):
     """Markdown block that applies Tau's themed inline link color."""
 
@@ -196,19 +194,20 @@ class ThemedMarkdownWidget(TextualMarkdown):
         super().__init__(markdown, classes=classes)
 
 
+# Roles rendered as free-flowing text with no left accent or role background,
+# matching how they appear while streaming.
+_BORDERLESS_TRANSCRIPT_ROLES = frozenset({"assistant", "thinking"})
+_HIDDEN_THINKING_PLACEHOLDER = "Thinking… Press Ctrl+T to show thinking tokens."
+
+
 class TranscriptMessageWidget(Horizontal):
-    """One selectable transcript message with a non-selectable visual gutter."""
+    """One selectable transcript message rendered as a full-height role block."""
 
     DEFAULT_CSS = """
     TranscriptMessageWidget {
         width: 1fr;
         height: auto;
         margin: 1 1 2 0;
-    }
-
-    TranscriptMessageWidget > .transcript-message-gutter {
-        width: 1;
-        height: auto;
     }
 
     TranscriptMessageWidget > .transcript-message-body {
@@ -229,28 +228,56 @@ class TranscriptMessageWidget(Horizontal):
         *,
         theme: TuiTheme,
         show_tool_results: bool,
+        custom_markup: str | None = None,
+        invocation: str | None = None,
+        result_markup: str | None = None,
     ) -> None:
         self.item = item
+        self._custom_markup = custom_markup if item.role == "custom" else None
+        self._invocation = invocation if item.role == "tool" else None
+        self._result_markup = result_markup if item.role == "tool" else None
         self.selection_text = transcript_item_selection_text(
             item,
             show_tool_results=show_tool_results,
+            custom_markup=self._custom_markup,
+            invocation=self._invocation,
+            result_markup=self._result_markup,
         )
         self._markdown_text = _transcript_item_markdown(
             item,
             show_tool_results=show_tool_results,
+            invocation=self._invocation,
         )
         self._theme = theme
         self._role_style = _chat_item_role_style(item, theme)
         super().__init__(classes="transcript-message")
+        foreground, background = _split_rich_style_colors(self._role_style.body)
+        self._body_foreground = foreground
+        if item.role in _BORDERLESS_TRANSCRIPT_ROLES:
+            self._body_background = None
+        else:
+            self._body_background = background
+            self.styles.border_left = ("tall", self._role_style.border)
+            if background:
+                self.styles.background = background
 
     def compose(self) -> Any:
-        gutter = NonSelectableStatic("▌", classes="transcript-message-gutter")
-        gutter.styles.color = self._role_style.border
-        body = self._body_widget()
-        yield gutter
-        yield body
+        yield self._body_widget()
 
     def _body_widget(self) -> Static | ThemedMarkdownWidget:
+        body: Static | ThemedMarkdownWidget
+        if self.item.role == "custom":
+            return Static(
+                _custom_body_renderable(
+                    self._custom_markup,
+                    raw_text=self.item.text,
+                    body_style=self._role_style.body,
+                ),
+                expand=True,
+                shrink=True,
+                markup=False,
+                classes="transcript-message-body transcript-plain-body",
+            )
         if _use_plain_transcript_body(self.item):
             body = Static(
                 _transcript_plain_body_text(
@@ -258,6 +285,8 @@ class TranscriptMessageWidget(Horizontal):
                     text=self.selection_text,
                     body_style=self._role_style.body,
                     theme=self._theme,
+                    invocation=self._invocation,
+                    result_markup=self._result_markup,
                 ),
                 expand=True,
                 shrink=True,
@@ -270,11 +299,10 @@ class TranscriptMessageWidget(Horizontal):
                 theme=self._theme,
                 classes="transcript-message-body transcript-markdown-body",
             )
-            foreground, background = _split_rich_style_colors(self._role_style.body)
-            if foreground:
-                body.styles.color = foreground
-            if background:
-                body.styles.background = background
+        if self._body_foreground:
+            body.styles.color = self._body_foreground
+        if self._body_background:
+            body.styles.background = self._body_background
         return body
 
     def get_selection(self, selection: Selection) -> tuple[str, str] | None:
@@ -283,6 +311,49 @@ class TranscriptMessageWidget(Horizontal):
         if not selected_text:
             return None
         return selected_text, "\n"
+
+    def refresh_invocation(
+        self,
+        *,
+        show_tool_results: bool,
+        invocation: str | None = None,
+        result_markup: str | None = None,
+    ) -> bool:
+        """Re-render a plain-body row's text in place; False when unsupported.
+
+        Used for high-frequency updates (spinner frames, live tool progress)
+        where remounting the widget causes visible layout flicker.
+        """
+        if self.item.role == "custom" or not _use_plain_transcript_body(self.item):
+            return False
+        self._invocation = invocation if self.item.role == "tool" else None
+        self._result_markup = result_markup if self.item.role == "tool" else None
+        self.selection_text = transcript_item_selection_text(
+            self.item,
+            show_tool_results=show_tool_results,
+            invocation=self._invocation,
+            result_markup=self._result_markup,
+        )
+        self._markdown_text = _transcript_item_markdown(
+            self.item,
+            show_tool_results=show_tool_results,
+            invocation=self._invocation,
+        )
+        try:
+            body = self.query_one(".transcript-plain-body", Static)
+        except NoMatches:
+            return False
+        body.update(
+            _transcript_plain_body_text(
+                self.item,
+                text=self.selection_text,
+                body_style=self._role_style.body,
+                theme=self._theme,
+                invocation=self._invocation,
+                result_markup=self._result_markup,
+            )
+        )
+        return True
 
 
 class StreamingTranscriptMessageWidget(ThemedMarkdownWidget):
@@ -300,7 +371,13 @@ class StreamingTranscriptMessageWidget(ThemedMarkdownWidget):
         margin: 0 0 1 0;
     }
 
-    StreamingTranscriptMessageWidget MarkdownFence {
+    StreamingTranscriptMessageWidget.-streaming MarkdownFence {
+        overflow-x: hidden;
+        scrollbar-size-horizontal: 0;
+    }
+
+    StreamingTranscriptMessageWidget.-finalized MarkdownFence {
+        overflow-x: auto;
         scrollbar-size-horizontal: 1;
     }
     """
@@ -311,8 +388,15 @@ class StreamingTranscriptMessageWidget(ThemedMarkdownWidget):
         self.item = item
         self.selection_text = item.text
         self._stream: MarkdownStream | None = None
+        self._is_streaming = True
         super().__init__(item.text, theme=theme)
         self.add_class("transcript-message")
+        self.add_class("-streaming")
+        # Apply the role foreground so streamed text matches the finalized block
+        # (e.g. dimmed thinking) instead of shifting color on the next redraw.
+        foreground, _ = _split_rich_style_colors(_chat_item_role_style(item, theme).body)
+        if foreground:
+            self.styles.color = foreground
 
     @property
     def stream(self) -> MarkdownStream:
@@ -321,20 +405,44 @@ class StreamingTranscriptMessageWidget(ThemedMarkdownWidget):
         return self._stream
 
     async def append_fragment(self, fragment: str) -> None:
-        """Append streamed markdown using the same renderer as finalized messages."""
+        """Append streamed markdown without reparsing the full accumulated message."""
         if not fragment:
             return
         self.item.text += fragment
         self.selection_text += fragment
+        await self.stream.write(fragment)
+
+    async def _stop_stream(self) -> None:
+        """Stop the Textual markdown stream, flushing pending fragments first."""
+        stream = self._stream
+        if stream is None:
+            return
         self._stream = None
-        await self.update(self.item.text)
+        await stream.stop()
 
     async def replace_text(self, text: str) -> None:
-        """Replace the current markdown text, usually with the final provider message."""
+        """Replace the current markdown text, usually with corrected final content."""
+        await self._stop_stream()
         self.item.text = text
         self.selection_text = text
-        self._stream = None
         await self.update(text)
+
+    async def finalize(self, text: str | None = None) -> None:
+        """Mark the streamed message complete and restore finalized Markdown chrome."""
+        if text is not None and text != self.selection_text:
+            await self.replace_text(text)
+        else:
+            if text is not None:
+                self.item.text = text
+                self.selection_text = text
+            await self._stop_stream()
+        self._is_streaming = False
+        self.remove_class("-streaming")
+        self.add_class("-finalized")
+
+    async def on_unmount(self) -> None:
+        """Cancel the markdown stream task if the widget is removed mid-stream."""
+        await self._stop_stream()
 
     def get_selection(self, selection: Selection) -> tuple[str, str] | None:
         """Return selected text from this streamed message block."""
@@ -362,6 +470,7 @@ class TranscriptView(VerticalScroll):
         self._active_thinking_widget: StreamingTranscriptMessageWidget | None = None
         self._hidden_thinking_placeholder_visible = False
         self._follow_output = True
+        self._follow_scroll_pending = False
 
     def on_mount(self) -> None:
         """Follow new transcript content until the user scrolls away."""
@@ -370,13 +479,17 @@ class TranscriptView(VerticalScroll):
     def follow_output(self) -> None:
         """Return to follow mode for a user-driven turn or explicit jump to bottom."""
         self._follow_output = True
-        self.anchor(False)
+        self.anchor(True)
         self._request_follow_scroll(force=True)
 
     def _request_follow_scroll(self, *, force: bool = False) -> None:
         """Scroll to the bottom after layout if follow mode is still active."""
+        if self._follow_scroll_pending and not force:
+            return
+        self._follow_scroll_pending = True
 
         def scroll_if_still_following() -> None:
+            self._follow_scroll_pending = False
             if force or self._follow_output or self.is_vertical_scroll_end:
                 self.scroll_end(animate=False, immediate=True)
 
@@ -395,6 +508,22 @@ class TranscriptView(VerticalScroll):
         elif new_value >= self.max_scroll_y:
             self._follow_output = True
 
+    async def _finalize_active_thinking_message(self) -> None:
+        """Stop streaming for a completed thinking block before another block starts."""
+        widget = self._active_thinking_widget
+        if widget is None:
+            return
+        await widget.finalize()
+        self._active_thinking_widget = None
+
+    async def _finalize_active_assistant_message(self) -> None:
+        """Stop streaming for a completed assistant block before another block starts."""
+        widget = self._active_assistant_widget
+        if widget is None:
+            return
+        await widget.finalize()
+        self._active_assistant_widget = None
+
     def update_from_state(
         self,
         state: TuiState,
@@ -405,6 +534,93 @@ class TranscriptView(VerticalScroll):
         self._render_state = state
         self._render_theme = theme
         self._redraw(scroll_end=self._should_follow_output)
+
+    def update_thinking_visibility(
+        self,
+        state: TuiState,
+        *,
+        theme: TuiTheme = TAU_DARK_THEME,
+    ) -> None:
+        """Update only thinking-token widgets after visibility changes."""
+        self._render_state = state
+        self._render_theme = theme
+        should_follow = self._should_follow_output
+        previous_scroll_y = self.scroll_y
+
+        message_children = [
+            child
+            for child in self.children
+            if isinstance(child, TranscriptMessageWidget | StreamingTranscriptMessageWidget)
+        ]
+        thinking_children = [child for child in message_children if child.item.role == "thinking"]
+        if thinking_children:
+            self.remove_children(thinking_children)
+
+        non_thinking_children = [
+            child for child in message_children if child.item.role != "thinking"
+        ]
+        non_thinking_index = 0
+        pending_thinking: list[TranscriptMessageWidget] = []
+        hidden_thinking_placeholder = False
+
+        def flush_pending(
+            *, before: TranscriptMessageWidget | StreamingTranscriptMessageWidget | None
+        ) -> None:
+            nonlocal pending_thinking
+            for widget in pending_thinking:
+                self.mount(widget, before=before)
+            pending_thinking = []
+
+        for item in state.items:
+            if item.role == "thinking":
+                if state.show_thinking:
+                    pending_thinking.append(
+                        TranscriptMessageWidget(
+                            item,
+                            theme=theme,
+                            show_tool_results=state.show_tool_results,
+                        )
+                    )
+                elif not hidden_thinking_placeholder:
+                    pending_thinking.append(
+                        TranscriptMessageWidget(
+                            ChatItem(role="thinking", text=_HIDDEN_THINKING_PLACEHOLDER),
+                            theme=theme,
+                            show_tool_results=state.show_tool_results,
+                        )
+                    )
+                    hidden_thinking_placeholder = True
+                continue
+
+            hidden_thinking_placeholder = False
+            target = None
+            while non_thinking_index < len(non_thinking_children):
+                candidate = non_thinking_children[non_thinking_index]
+                non_thinking_index += 1
+                if candidate.item is item:
+                    target = candidate
+                    break
+            if target is not None:
+                flush_pending(before=target)
+
+        tail_child = (
+            non_thinking_children[non_thinking_index]
+            if non_thinking_index < len(non_thinking_children)
+            else None
+        )
+        flush_pending(before=tail_child)
+        self._active_thinking_widget = None
+        self._hidden_thinking_placeholder_visible = (
+            _last_transcript_child_is_hidden_thinking_placeholder(self.children)
+        )
+        self._last_render_width = self.scrollable_content_region.width
+        self.refresh(layout=True)
+        if should_follow:
+            self._request_follow_scroll()
+        else:
+            self.call_after_refresh(
+                lambda: self.scroll_to(y=previous_scroll_y, animate=False, immediate=True)
+            )
 
     def on_resize(self, event: Resize) -> None:
         """Re-render transcript entries when the terminal width changes."""
@@ -442,7 +658,7 @@ class TranscriptView(VerticalScroll):
                         TranscriptMessageWidget(
                             ChatItem(
                                 role="thinking",
-                                text="Thinking… Press Ctrl+T to show thinking tokens.",
+                                text=_HIDDEN_THINKING_PLACEHOLDER,
                             ),
                             theme=theme,
                             show_tool_results=state.show_tool_results,
@@ -451,11 +667,22 @@ class TranscriptView(VerticalScroll):
                     hidden_thinking_placeholder = True
                 continue
             hidden_thinking_placeholder = False
+            custom_markup = (
+                state.resolve_custom_markup(item, expanded=state.show_tool_results)
+                if item.role == "custom"
+                else None
+            )
             self.mount(
                 TranscriptMessageWidget(
                     item,
                     theme=theme,
                     show_tool_results=state.show_tool_results or item.always_show_tool_result,
+                    custom_markup=custom_markup,
+                    invocation=state.resolve_tool_invocation(item),
+                    result_markup=state.resolve_tool_result(
+                        item,
+                        expanded=state.show_tool_results or item.always_show_tool_result,
+                    ),
                 )
             )
         if state.assistant_buffer:
@@ -477,14 +704,22 @@ class TranscriptView(VerticalScroll):
         theme: TuiTheme = TAU_DARK_THEME,
         show_tool_results: bool = False,
         scroll_end: bool = False,
+        custom_markup: str | None = None,
+        invocation: str | None = None,
+        result_markup: str | None = None,
     ) -> TranscriptMessageWidget | StreamingTranscriptMessageWidget:
         """Append one transcript item without rebuilding previous blocks."""
         should_follow = self._should_follow_output if not scroll_end else True
+        await self._finalize_active_assistant_message()
+        await self._finalize_active_thinking_message()
         self._render_theme = theme
         widget = _transcript_widget(
             item,
             theme=theme,
             show_tool_results=show_tool_results,
+            custom_markup=custom_markup,
+            invocation=invocation,
+            result_markup=result_markup,
         )
         await self.mount(widget)
         self._active_assistant_widget = None
@@ -496,6 +731,42 @@ class TranscriptView(VerticalScroll):
             self._request_follow_scroll(force=scroll_end)
         return widget
 
+    async def update_item(
+        self,
+        item: ChatItem,
+        *,
+        theme: TuiTheme = TAU_DARK_THEME,
+        show_tool_results: bool = False,
+        invocation: str | None = None,
+        result_markup: str | None = None,
+    ) -> bool:
+        """Re-render one already-mounted transcript item in place."""
+        for child in self.children:
+            if isinstance(child, TranscriptMessageWidget) and child.item is item:
+                # Prefer updating the mounted widget's content: remounting
+                # forces a layout pass and follow-scroll on every call, which
+                # reads as transcript flicker at spinner-tick frequency.
+                if child.refresh_invocation(
+                    show_tool_results=show_tool_results,
+                    invocation=invocation,
+                    result_markup=result_markup,
+                ):
+                    return True
+                replacement = _transcript_widget(
+                    item,
+                    theme=theme,
+                    show_tool_results=show_tool_results,
+                    invocation=invocation,
+                    result_markup=result_markup,
+                )
+                await self.mount(replacement, after=child)
+                await child.remove()
+                self.refresh(layout=True)
+                if self._should_follow_output:
+                    self._request_follow_scroll()
+                return True
+        return False
+
     async def start_assistant_message(
         self,
         *,
@@ -505,6 +776,7 @@ class TranscriptView(VerticalScroll):
         """Create the active assistant message widget if needed."""
         if self._active_assistant_widget is not None:
             return self._active_assistant_widget
+        await self._finalize_active_thinking_message()
         should_follow = self._should_follow_output if not scroll_end else True
         widget = StreamingTranscriptMessageWidget(
             ChatItem(role="assistant", text=""),
@@ -526,8 +798,6 @@ class TranscriptView(VerticalScroll):
         scroll_end: bool = False,
     ) -> None:
         """Append streamed assistant text to the active message widget."""
-        self._active_thinking_widget = None
-        self._hidden_thinking_placeholder_visible = False
         should_follow = self._should_follow_output if not scroll_end else True
         widget = await self.start_assistant_message(theme=theme, scroll_end=scroll_end)
         await widget.append_fragment(delta)
@@ -547,15 +817,21 @@ class TranscriptView(VerticalScroll):
         if not show_thinking:
             if self._hidden_thinking_placeholder_visible:
                 return
-            await self.append_item(
+            widget = TranscriptMessageWidget(
                 ChatItem(
                     role="thinking",
-                    text="Thinking… Press Ctrl+T to show thinking tokens.",
+                    text=_HIDDEN_THINKING_PLACEHOLDER,
                 ),
                 theme=theme,
-                scroll_end=should_follow,
+                show_tool_results=False,
             )
+            await self.mount(widget, before=self._active_assistant_widget)
+            self._active_thinking_widget = None
             self._hidden_thinking_placeholder_visible = True
+            self._last_render_width = self.scrollable_content_region.width
+            self.refresh(layout=True)
+            if should_follow:
+                self._request_follow_scroll(force=scroll_end)
             return
         self._hidden_thinking_placeholder_visible = False
         if self._active_thinking_widget is None:
@@ -563,7 +839,10 @@ class TranscriptView(VerticalScroll):
                 ChatItem(role="thinking", text=""),
                 theme=theme,
             )
-            await self.mount(self._active_thinking_widget)
+            await self.mount(
+                self._active_thinking_widget,
+                before=self._active_assistant_widget,
+            )
         await self._active_thinking_widget.append_fragment(delta)
         if should_follow:
             self._request_follow_scroll(force=scroll_end)
@@ -578,9 +857,9 @@ class TranscriptView(VerticalScroll):
                     theme=self._render_theme,
                 )
             return
-        if text is not None:
-            await widget.replace_text(text)
+        await widget.finalize(text)
         self._active_assistant_widget = None
+        self._hidden_thinking_placeholder_visible = False
 
     @property
     def lines(self) -> tuple[TranscriptLine, ...]:
@@ -597,11 +876,24 @@ class TranscriptView(VerticalScroll):
         )
 
 
+def _last_transcript_child_is_hidden_thinking_placeholder(children: Sequence[Widget]) -> bool:
+    for child in reversed(children):
+        if isinstance(child, TranscriptMessageWidget | StreamingTranscriptMessageWidget):
+            return (
+                child.item.role == "thinking"
+                and child.selection_text == _HIDDEN_THINKING_PLACEHOLDER
+            )
+    return False
+
+
 def _transcript_widget(
     item: ChatItem,
     *,
     theme: TuiTheme,
     show_tool_results: bool,
+    custom_markup: str | None = None,
+    invocation: str | None = None,
+    result_markup: str | None = None,
 ) -> TranscriptMessageWidget | StreamingTranscriptMessageWidget:
     if item.role in {"assistant", "thinking"}:
         return StreamingTranscriptMessageWidget(item, theme=theme)
@@ -609,6 +901,9 @@ def _transcript_widget(
         item,
         theme=theme,
         show_tool_results=show_tool_results,
+        custom_markup=custom_markup,
+        invocation=invocation,
+        result_markup=result_markup,
     )
 
 
@@ -616,9 +911,49 @@ def transcript_item_selection_text(
     item: ChatItem,
     *,
     show_tool_results: bool = False,
+    custom_markup: str | None = None,
+    invocation: str | None = None,
+    result_markup: str | None = None,
 ) -> str:
     """Return the plain text represented by a selectable transcript item."""
-    return _visible_chat_text(item, show_tool_results=show_tool_results)
+    if item.role == "custom":
+        return _custom_selection_text(custom_markup, item.text)
+    if item.role == "tool" and result_markup is not None:
+        # A tool-rendered result replaces the generic block: invocation line
+        # plus the markup-stripped card.
+        invocation_line = invocation if invocation else item.text
+        return f"{invocation_line}\n{_custom_markup_to_text(result_markup).plain}"
+    return _visible_chat_text(item, show_tool_results=show_tool_results, invocation=invocation)
+
+
+def _custom_markup_to_text(markup: str) -> Text:
+    """Parse Rich markup safely; fall back to literal text on malformed markup."""
+    try:
+        return Text.from_markup(markup)
+    except Exception:  # noqa: BLE001 - a bad renderer string must never crash the TUI
+        return Text(markup)
+
+
+def _custom_selection_text(markup: str | None, raw_text: str) -> str:
+    """Return the plain (markup-stripped) text of a custom item for selection."""
+    if markup is None:
+        return raw_text
+    return _custom_markup_to_text(markup).plain
+
+
+def _custom_body_renderable(
+    markup: str | None,
+    *,
+    raw_text: str,
+    body_style: str,
+) -> RenderableType:
+    """Render a custom message body from renderer markup, or raw text on fallback."""
+    if markup is None:
+        return Text(raw_text, style=body_style, overflow="fold", no_wrap=False)
+    text = _custom_markup_to_text(markup)
+    text.overflow = "fold"
+    text.no_wrap = False
+    return text
 
 
 def _split_rich_style_colors(style: str) -> tuple[str | None, str | None]:
@@ -640,14 +975,29 @@ def _transcript_plain_body_text(
     text: str,
     body_style: str,
     theme: TuiTheme,
+    invocation: str | None = None,
+    result_markup: str | None = None,
 ) -> RenderableType:
     """Return styled transcript text for selectable plain rows."""
     if item.role != "tool":
         return Text(text, style=body_style, overflow="fold", no_wrap=False)
 
-    invocation, separator, result_text = text.partition("\n\n")
+    if result_markup is not None:
+        # The tool's `render_result` markup replaces the generic result block;
+        # the invocation line keeps its usual status-accented rendering.
+        invocation_text = _render_transcript_tool_invocation(
+            invocation if invocation else item.text,
+            body_style=body_style,
+            accent_style=_tool_accent_style(item, theme=theme),
+        )
+        markup_text = _custom_markup_to_text(result_markup)
+        markup_text.overflow = "fold"
+        markup_text.no_wrap = False
+        return Group(invocation_text, markup_text)
+
+    invocation_line, separator, result_text = text.partition("\n\n")
     invocation_text = _render_transcript_tool_invocation(
-        invocation,
+        invocation_line,
         body_style=body_style,
         accent_style=_tool_accent_style(item, theme=theme),
     )
@@ -690,9 +1040,12 @@ def _transcript_item_markdown(
     item: ChatItem,
     *,
     show_tool_results: bool,
+    invocation: str | None = None,
 ) -> str:
     """Return Markdown for a transcript item using native Textual Markdown blocks."""
-    visible_text = _visible_chat_text(item, show_tool_results=show_tool_results)
+    visible_text = _visible_chat_text(
+        item, show_tool_results=show_tool_results, invocation=invocation
+    )
     if item.role in {"assistant", "thinking", "status", "branch_summary", "compaction_summary"}:
         return visible_text
     return _plain_markdown(visible_text)
@@ -830,27 +1183,35 @@ def render_chat_item(
     *,
     theme: TuiTheme = TAU_DARK_THEME,
     show_tool_results: bool = False,
+    custom_markup: str | None = None,
 ) -> RenderableType:
     """Render a chat item as a standalone Toad-inspired transcript block."""
     role_style = _chat_item_role_style(item, theme)
-    body = (
-        _render_tool_chat_body(
-            item,
-            body_style=theme.role_styles["tool"].body,
-            accent_style=_tool_accent_style(item, theme=theme),
-            show_tool_results=show_tool_results,
-            syntax_theme=theme.syntax_theme,
-            theme=theme,
-        )
-        if item.role == "tool"
-        else _render_chat_body(
-            _visible_chat_text(item, show_tool_results=show_tool_results),
-            role=item.role,
+    if item.role == "custom":
+        body: RenderableType = _custom_body_renderable(
+            custom_markup,
+            raw_text=item.text,
             body_style=role_style.body,
-            syntax_theme=theme.syntax_theme,
-            theme=theme,
         )
-    )
+    else:
+        body = (
+            _render_tool_chat_body(
+                item,
+                body_style=theme.role_styles["tool"].body,
+                accent_style=_tool_accent_style(item, theme=theme),
+                show_tool_results=show_tool_results,
+                syntax_theme=theme.syntax_theme,
+                theme=theme,
+            )
+            if item.role == "tool"
+            else _render_chat_body(
+                _visible_chat_text(item, show_tool_results=show_tool_results),
+                role=item.role,
+                body_style=role_style.body,
+                syntax_theme=theme.syntax_theme,
+                theme=theme,
+            )
+        )
     table = Table.grid(expand=True)
     table.add_column(width=1, style=role_style.border)
     table.add_column(ratio=1, style=role_style.body)
@@ -946,7 +1307,12 @@ def _split_tool_invocation(text: str) -> tuple[str, str, str]:
     return "", name, f"{separator}{remainder}" if separator else ""
 
 
-def _visible_chat_text(item: ChatItem, *, show_tool_results: bool) -> str:
+def _visible_chat_text(
+    item: ChatItem,
+    *,
+    show_tool_results: bool,
+    invocation: str | None = None,
+) -> str:
     if item.role == "branch_summary":
         if show_tool_results and item.tool_result_text:
             return f"**Branch Summary**\n\n{item.tool_result_text}"
@@ -955,9 +1321,14 @@ def _visible_chat_text(item: ChatItem, *, show_tool_results: bool) -> str:
         if show_tool_results and item.tool_result_text:
             return f"**Compaction Summary**\n\n{item.tool_result_text}"
         return item.text
-    if item.role not in {"tool", "skill"} or not show_tool_results or not item.tool_result_text:
+    if item.role not in {"tool", "skill"}:
         return item.text
-    return f"{item.text}\n\n{item.tool_result_text}"
+    text = invocation if item.role == "tool" and invocation else item.text
+    if show_tool_results and item.tool_result_text:
+        return f"{text}\n\n{item.tool_result_text}"
+    if item.update_text and not item.tool_result_text:
+        return f"{text}\n\n… {item.update_text}"
+    return text
 
 
 def _render_chat_body(
@@ -1058,7 +1429,7 @@ class ThemedCodeBlock(CodeBlock):
 class LeftAlignedMarkdownHeading(Heading):
     """Rich Markdown heading that keeps all heading levels left-aligned."""
 
-    LEVEL_ALIGN: ClassVar[dict[str, str]] = {
+    LEVEL_ALIGN: ClassVar[dict[str, Literal["default", "left", "center", "right", "full"]]] = {
         "h1": "left",
         "h2": "left",
         "h3": "left",
@@ -1258,7 +1629,7 @@ def _context_file_label(path: Path, *, cwd: Path) -> str:
         expanded_path = cwd / expanded_path
     try:
         return str(expanded_path.resolve().relative_to(cwd.expanduser().resolve()))
-    except OSError, ValueError:
+    except (OSError, ValueError):
         return _short_path(expanded_path)
 
 
