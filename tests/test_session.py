@@ -108,6 +108,37 @@ def test_legacy_assistant_message_migrates_to_ordered_blocks() -> None:
     assert [block["type"] for block in rewritten["content"]] == ["text", "toolCall"]
 
 
+def test_assistant_message_with_legacy_null_usage_cost_migrates() -> None:
+    legacy = json.dumps(
+        {
+            "type": "message",
+            "id": "a",
+            "timestamp": 1,
+            "message": {
+                "role": "assistant",
+                "content": "Done.",
+                "usage": {
+                    "input": 10,
+                    "output": 2,
+                    "cache_read": 0,
+                    "cache_write": 0,
+                    "total_tokens": 12,
+                    "cost": None,
+                },
+            },
+        }
+    )
+
+    entry = entry_from_json_line(legacy)
+
+    assert isinstance(entry, MessageEntry)
+    assert isinstance(entry.message, AssistantMessage)
+    assert entry.message.usage.total_tokens == 12
+    assert entry.message.usage.cost.total == 0.0
+    rewritten = json.loads(entry_to_json_line(entry))["message"]
+    assert rewritten["usage"]["cost"]["total"] == 0.0
+
+
 def test_legacy_tool_message_migrates_and_preserves_data() -> None:
     legacy = json.dumps(
         {

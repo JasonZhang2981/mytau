@@ -70,6 +70,12 @@ def _migrate_message(value: Any) -> Any:
         return message
 
     if role == "assistant":
+        usage = message.get("usage")
+        if isinstance(usage, dict) and usage.get("cost") is None:
+            usage = dict(usage)
+            usage["cost"] = {}
+            message["usage"] = usage
+
         content = message.get("content", "")
         if isinstance(content, str):
             blocks: list[Any] = []
