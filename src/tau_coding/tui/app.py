@@ -1917,9 +1917,7 @@ class ModelPickerScreen(ModalScreen[ModelChoice | None]):
         self.query_one("#model-picker-help", Static).update(help_text)
 
 
-class CustomProviderLoginScreen(
-    ModalScreen[CustomProviderLoginResult | _LoginFlowAction | None]
-):
+class CustomProviderLoginScreen(ModalScreen[CustomProviderLoginResult | _LoginFlowAction | None]):
     """Prompt for adding an OpenAI-compatible custom provider."""
 
     BINDINGS: ClassVar[list[BindingEntry]] = [
@@ -4420,9 +4418,7 @@ class TauTuiApp(App[None]):
             return
         self.push_screen(
             LoginScreen(entry, theme=self.tui_settings.resolved_theme),
-            callback=lambda api_key: self._handle_api_key_login_navigation_result(
-                entry, api_key
-            ),
+            callback=lambda api_key: self._handle_api_key_login_navigation_result(entry, api_key),
         )
 
     def _handle_api_key_login_navigation_result(
@@ -4511,9 +4507,7 @@ class TauTuiApp(App[None]):
             callback=self._handle_logout_provider_result,
         )
 
-    def _handle_logout_provider_result(
-        self, provider_name: str | _LoginFlowAction | None
-    ) -> None:
+    def _handle_logout_provider_result(self, provider_name: str | _LoginFlowAction | None) -> None:
         if isinstance(provider_name, str):
             self._logout(provider_name)
 
