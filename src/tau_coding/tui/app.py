@@ -2874,6 +2874,9 @@ class TauTuiApp(App[None]):
         self._completion_visible_line_budget: int | None = None
         self._activity_frame = 0
         self._activity_timer: Timer | None = None
+        self._last_tool_timer_refresh_at = 0.0
+        self._last_activity_indicator_key: tuple[object, ...] | None = None
+        self._last_queue_render_key: tuple[object, ...] | None = None
         self._terminal_title = TerminalTitleController()
         self._active_notification_keys: set[tuple[str, str]] = set()
         self._supports_pyperclip: bool | None = None
@@ -3872,8 +3875,16 @@ class TauTuiApp(App[None]):
             f"$ {command.strip()}",
             always_show_tool_result=True,
         )
+        item = self.state.items[item_index]
         self._follow_transcript_output()
-        self._refresh()
+        transcript = self.query_one("#transcript", TranscriptView)
+        await transcript.append_item(
+            item,
+            theme=self.tui_settings.resolved_theme,
+            show_tool_results=True,
+            scroll_end=True,
+        )
+        self._refresh_chrome()
 
         try:
             result = await run_terminal_command(command, add_to_context=add_to_context)
@@ -3886,7 +3897,12 @@ class TauTuiApp(App[None]):
                     output=str(exc),
                 )
             self._notify(f"Could not run command: {exc}", severity="error")
-            self._refresh()
+            await transcript.update_item(
+                item,
+                theme=self.tui_settings.resolved_theme,
+                show_tool_results=True,
+            )
+            self._refresh_chrome()
             return
 
         if item_index >= len(self.state.items):
@@ -3899,7 +3915,12 @@ class TauTuiApp(App[None]):
             output=result.output,
         )
         self._follow_transcript_output()
-        self._refresh()
+        await transcript.update_item(
+            item,
+            theme=self.tui_settings.resolved_theme,
+            show_tool_results=True,
+        )
+        self._refresh_chrome()
 
     def _replace_tui_settings(self, *, theme: TuiThemeName) -> None:
         """Replace the current immutable TUI settings with a new theme."""
@@ -3929,7 +3950,7 @@ class TauTuiApp(App[None]):
         except Exception as exc:  # noqa: BLE001 - surface queueing failures in the TUI
             self._notify(f"Could not queue message: {exc}", severity="error")
             return
-        self._refresh()
+        self._refresh_chrome()
 
     async def _run_prompt(
         self,
@@ -4009,7 +4030,6 @@ class TauTuiApp(App[None]):
                     theme=theme,
                     show_thinking=self.state.show_thinking,
                 )
-            self._sync_activity_indicator()
             return
         if isinstance(event, MessageEndEvent):
             if isinstance(event.message, (UserMessage, CustomMessage)):
@@ -4026,18 +4046,32 @@ class TauTuiApp(App[None]):
                 visible_blocks = [
                     block
                     for block in event.message.content
-                    if isinstance(block, (TextContent, ThinkingContent))
+                    if (
+                        isinstance(block, TextContent)
+                        and bool(block.text)
+                        or isinstance(block, ThinkingContent)
+                        and bool(block.thinking)
+                    )
                 ]
+                canonical_items = self.state.items[-len(visible_blocks) :] if visible_blocks else []
                 if (
                     any(isinstance(block, ThinkingContent) for block in visible_blocks)
                     or len(visible_blocks) > 1
                 ):
-                    # The adapter replaced provisional rows with canonical ordered
-                    # blocks. Redraw through the normal extension-aware path.
-                    self._refresh()
+                    # Replace only this message's provisional streaming widgets;
+                    # unrelated history remains mounted and selectable.
+                    await transcript.finish_structured_assistant_message(
+                        canonical_items,
+                        theme=theme,
+                        show_thinking=self.state.show_thinking,
+                    )
                 else:
-                    await transcript.finish_assistant_message(event.message.text)
-                    self._refresh_chrome()
+                    canonical_item = canonical_items[-1] if canonical_items else None
+                    await transcript.finish_assistant_message(
+                        event.message.text,
+                        item=canonical_item,
+                    )
+                self._refresh_chrome()
                 return
             return
         if isinstance(event, ToolExecutionStartEvent):
@@ -4076,7 +4110,17 @@ class TauTuiApp(App[None]):
             self._refresh_chrome()
             return
         if isinstance(event, ToolExecutionEndEvent):
-            self._refresh()
+            updated_item = self.state.find_tool_item(event.tool_call_id)
+            if updated_item is not None:
+                expanded = self.state.show_tool_results or updated_item.always_show_tool_result
+                await transcript.update_item(
+                    updated_item,
+                    theme=theme,
+                    show_tool_results=expanded,
+                    invocation=self.state.resolve_tool_invocation(updated_item),
+                    result_markup=self.state.resolve_tool_result(updated_item, expanded=expanded),
+                )
+            self._refresh_chrome()
             return
         if isinstance(event, QueueUpdateEvent):
             self._refresh_chrome()
@@ -4293,10 +4337,17 @@ class TauTuiApp(App[None]):
         self.run_worker(self._cycle_scoped_model(), exclusive=False)
 
     def action_toggle_tool_results(self) -> None:
-        """Toggle inline tool result details in the transcript."""
+        """Toggle inline tool result details without rebuilding unrelated history."""
         expanded = self.state.toggle_tool_results()
-        self._refresh()
+        self.run_worker(self._update_tool_results_visibility(), exclusive=False)
         self._notify("Tool results expanded." if expanded else "Tool results collapsed.")
+
+    async def _update_tool_results_visibility(self) -> None:
+        transcript = self.query_one("#transcript", TranscriptView)
+        await transcript.update_tool_results_visibility(
+            self.state,
+            theme=self.tui_settings.resolved_theme,
+        )
 
     def action_toggle_thinking(self) -> None:
         """Toggle thinking-token display in the transcript."""
@@ -4862,8 +4913,16 @@ class TauTuiApp(App[None]):
         compact_info = self.query_one("#compact-session-info", CompactSessionInfo)
         compact_info.update_from_session(self.session, theme=theme)
         queued_messages = self.query_one("#queued-messages", Static)
-        queued_messages.display = self.state.queued_message_count > 0
-        queued_messages.update(_render_queued_messages(self.state, theme=theme))
+        queue_render_key = (
+            self.state.queued_steering,
+            self.state.queued_follow_up,
+            theme.name,
+            theme.muted_text,
+        )
+        if queue_render_key != self._last_queue_render_key:
+            self._last_queue_render_key = queue_render_key
+            queued_messages.display = self.state.queued_message_count > 0
+            queued_messages.update(_render_queued_messages(self.state, theme=theme))
         self._sync_activity_indicator()
         self._refresh_footer_bindings()
 
@@ -4897,7 +4956,10 @@ class TauTuiApp(App[None]):
         self._activity_frame += 1
         self._apply_activity_indicator()
         self._sync_terminal_title()
-        self.call_later(self._refresh_pending_tool_timer)
+        now = asyncio.get_running_loop().time()
+        if now - self._last_tool_timer_refresh_at >= 1.0:
+            self._last_tool_timer_refresh_at = now
+            self.call_later(self._refresh_pending_tool_timer)
 
     async def _refresh_pending_tool_timer(self) -> None:
         """Refresh elapsed time on the tool row that is currently executing."""
@@ -4933,13 +4995,26 @@ class TauTuiApp(App[None]):
             prompt_prefix = self.query_one("#prompt-prefix", Static)
         except NoMatches:
             return
+        shell_mode = _is_terminal_command_prompt(prompt.text)
+        render_key = (
+            theme.name,
+            theme.accent,
+            theme.screen_background,
+            theme.prompt_border,
+            self._activity_frame,
+            self.state.running,
+            shell_mode,
+        )
+        if render_key == self._last_activity_indicator_key:
+            return
+        self._last_activity_indicator_key = render_key
         prompt.styles.border = (
             "tall",
             _activity_prompt_border_color(
                 theme,
                 frame=self._activity_frame,
                 running=self.state.running,
-                shell_mode=_is_terminal_command_prompt(prompt.text),
+                shell_mode=shell_mode,
             ),
         )
         prompt_prefix.update(
@@ -4947,7 +5022,8 @@ class TauTuiApp(App[None]):
                 theme,
                 frame=self._activity_frame,
                 running=self.state.running,
-            )
+            ),
+            layout=False,
         )
 
     def _refresh_completions(self) -> None:
