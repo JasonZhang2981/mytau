@@ -6,7 +6,6 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
 
 from tau_agent.messages import (
     AgentMessage,
@@ -23,19 +22,9 @@ from tau_agent.tools import AgentToolResult, ToolCall
 from tau_agent.types import JSONValue
 from tau_coding.extensions.api import CustomMessageMarkup, ToolCallMarkup, ToolResultMarkup
 from tau_coding.skills import Skill, parse_skill_invocation
+from tau_coding.tui.themes import TranscriptRole
 
-ChatItemRole = Literal[
-    "user",
-    "assistant",
-    "tool",
-    "error",
-    "status",
-    "thinking",
-    "skill",
-    "branch_summary",
-    "compaction_summary",
-    "custom",
-]
+ChatItemRole = TranscriptRole
 TOOL_RESULT_PREVIEW_LINES = 8
 TOOL_PATCH_PREVIEW_LINES = 32
 TOOL_RESULT_PREVIEW_CHARS = 2_000
